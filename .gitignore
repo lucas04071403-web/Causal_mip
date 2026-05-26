@@ -1,0 +1,45 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+Untitled
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Local experiment workspace and generated artifacts
+mip_workspace/
+outputs/
+checkpoints/
+model_caches/
+runs/
+wandb/
+
+# Large model/data artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.arrow
+*.parquet
+*.ckpt
+
+# Old git backup made when reinitializing this as a new project
+.git_old_*/
+.git_old_backup_name
