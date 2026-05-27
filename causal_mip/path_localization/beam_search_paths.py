@@ -19,6 +19,7 @@ def _generate_candidate_paths_from_sample_scores(
     num_candidates: int,
     per_layer_topk: int,
     path_counter_start: int = 0,
+    source_sample_idx: int | None = None,
 ) -> tuple[list[CandidatePath], int]:
     """Create one-neuron-per-layer candidate paths from a (layers, neurons) score tensor."""
     if sample_scores.dim() != 2:
@@ -88,6 +89,8 @@ def _generate_candidate_paths_from_sample_scores(
             modality=modality,
             mip_score=mip_score,
             nodes=nodes,
+            source_sample_idx=source_sample_idx,
+            metadata={"source_sample_idx": source_sample_idx} if source_sample_idx is not None else {},
         ))
         path_counter += 1
         if len(candidate_paths) >= num_candidates:
@@ -219,6 +222,7 @@ def compute_fisher_topk_paths(
             num_candidates=num_candidates,
             per_layer_topk=per_layer_topk,
             path_counter_start=path_counter,
+            source_sample_idx=sample_idx,
         )
         candidate_paths.extend(sample_paths)
     return candidate_paths
@@ -336,6 +340,7 @@ def extract_vision_paths_from_mip_scores(
             num_candidates=num_candidates,
             per_layer_topk=per_layer_topk,
             path_counter_start=path_counter,
+            source_sample_idx=sample_idx,
         )
         candidate_paths.extend(sample_paths)
 

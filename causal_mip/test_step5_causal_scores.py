@@ -61,11 +61,13 @@ class ToyWrapper(nn.Module):
         super().__init__()
         self.language_model = ToyLanguageModel(hidden_size, num_layers)
         self.visual = ToyVisionModel(hidden_size, num_layers)
+        self.mm_projector = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, hidden_states, pixel_values=None):
         if pixel_values is not None:
             visual_states = self.visual(pixel_values)
-            hidden_states = hidden_states + visual_states.mean(dim=0).view(1, 1, -1)
+            projected_states = self.mm_projector(visual_states)
+            hidden_states = hidden_states + projected_states.mean(dim=0).view(1, 1, -1)
         return self.language_model(hidden_states)
 
 
@@ -90,6 +92,7 @@ class ToyModel(nn.Module):
 def _prepared_batch(
     input_ids: torch.Tensor,
     answer_positions=None,
+    image_positions=None,
     pixel_values: torch.Tensor | None = None,
 ) -> PreparedSampleBatch:
     attention_mask = torch.ones_like(input_ids)
@@ -105,7 +108,7 @@ def _prepared_batch(
         input_ids=input_ids,
         attention_mask=attention_mask,
         labels=labels,
-        image_token_positions=[],
+        image_token_positions=image_positions or [],
         answer_token_positions=answer_positions or [2, 3],
         all_token_positions=[0, 1, 2, 3],
         prompt_length=2,
@@ -176,6 +179,10 @@ def test_causal_scores():
     assert record["Nec"] == necessity["necessity"]
     assert record["Suf"] == sufficiency["sufficiency"]
     assert record["Ret"] == retain["retain_impact"]
+    assert "clean_target" in record["sufficiency"]
+    assert "corrupt_target" in record["sufficiency"]
+    assert "restored_nodes" in record["sufficiency"]
+    assert record["sufficiency"]["clean_target"]["answer_token_positions"] == [2, 3]
 
 
 def test_vision_path_causal_scores():
@@ -208,9 +215,76 @@ def test_vision_path_causal_scores():
     assert record["Ret"] is not None
 
 
+def test_vision_text_projector_path_causal_scores():
+    torch.manual_seed(17)
+    model = ToyModel()
+    candidate_path = CandidatePath(
+        path_id="vision_text_projector",
+        source="test",
+        modality="vision_text",
+        mip_score=0.75,
+        nodes=[
+            PathNode("model.visual.blocks.0.mlp.down_proj", 0, 1, "image_tokens"),
+            PathNode("mm_projector", None, 0, "image_tokens"),
+            PathNode("model.language_model.layers.0.mlp.down_proj", 0, 2, "image_tokens"),
+            PathNode("model.language_model.layers.1.mlp.down_proj", 1, 3, "answer_tokens"),
+        ],
+    )
+    clean_batch = _prepared_batch(
+        torch.tensor([[1, 2, 3, 4]]),
+        image_positions=[0, 1],
+        pixel_values=torch.randn(5, 8),
+    )
+    corrupt_batch = _prepared_batch(
+        torch.tensor([[1, 2, 7, 8]]),
+        image_positions=[0, 1],
+        pixel_values=torch.randn(5, 8),
+    )
+    retain_batches = {
+        "same_topic": _prepared_batch(
+            torch.tensor([[1, 2, 4, 5]]),
+            image_positions=[0, 1],
+            pixel_values=torch.randn(5, 8),
+        ),
+        "same_reasoning": _prepared_batch(
+            torch.tensor([[1, 2, 6, 7]]),
+            image_positions=[0, 1],
+            pixel_values=torch.randn(5, 8),
+        ),
+        "counterfactual_retain": _prepared_batch(
+            torch.tensor([[1, 2, 8, 9]]),
+            image_positions=[0, 1],
+            pixel_values=torch.randn(5, 8),
+        ),
+    }
+    record = compute_path_causal_score_record(
+        model=model,
+        candidate_path=candidate_path,
+        pair={"pair_id": "pair_projector"},
+        prepared_batches={
+            "forget_clean": clean_batch,
+            "forget_corrupt_target_clean_answer": corrupt_batch,
+            **retain_batches,
+        },
+        strict=True,
+    )
+    assert record["status"] == "ok"
+    assert record["num_nodes"] == 4
+    assert record["num_patchable_nodes"] == 4
+    assert record["Nec"] is not None
+    assert record["Suf"] is not None
+    assert record["Ret"] is not None
+    restored_modules = {
+        node["module"]
+        for node in record["sufficiency"]["restored_nodes"]
+    }
+    assert "model.mm_projector" in restored_modules
+
+
 def main():
     test_causal_scores()
     test_vision_path_causal_scores()
+    test_vision_text_projector_path_causal_scores()
     print("Step 5 causal-score tests passed.")
 
 

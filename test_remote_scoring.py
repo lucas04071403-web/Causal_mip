@@ -6,7 +6,9 @@
 
 import json
 import sys
-sys.path.insert(0, '/home/lucas/Desktop/CurrentReacher/MIP_fusion7/MIP-Editor')
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score_by_llm import load_remote_llm, score_by_remote_llm_batch, build_conversation_for_gen_task, build_conversation_for_clf_task
 

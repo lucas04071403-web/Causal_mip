@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from causal_mip.interventions.activation_cache import (
+    ALL_VISUAL_TOKEN_POSITIONS,
     CachedPathActivations,
     PreparedSampleBatch,
     resolve_token_positions,
@@ -12,20 +13,25 @@ def build_restoration_interventions(
     cached_path: CachedPathActivations,
     prepared_batch: PreparedSampleBatch | None = None,
 ) -> list[NodeIntervention]:
-    return [
-        NodeIntervention(
-            module=node.module,
-            token_positions=(
-                resolve_token_positions(prepared_batch, node.token_selector)
-                if prepared_batch is not None and node.module_kind != "vision"
-                else list(node.token_positions)
-            ),
-            neuron=node.neuron,
-            mode="restore",
-            values=node.values,
+    interventions = []
+    for node in cached_path.nodes:
+        token_positions = list(node.token_positions)
+        if prepared_batch is not None and node.module_kind != "vision":
+            candidate_positions = resolve_token_positions(prepared_batch, node.token_selector)
+            if len(candidate_positions) == node.values.numel():
+                token_positions = candidate_positions
+            elif token_positions == list(ALL_VISUAL_TOKEN_POSITIONS):
+                token_positions = candidate_positions
+        interventions.append(
+            NodeIntervention(
+                module=node.module,
+                token_positions=token_positions,
+                neuron=node.neuron,
+                mode="restore",
+                values=node.values,
+            )
         )
-        for node in cached_path.nodes
-    ]
+    return interventions
 
 
 def restore_path_activations(

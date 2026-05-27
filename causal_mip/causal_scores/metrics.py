@@ -96,7 +96,7 @@ def compute_path_causal_score_record(
     strict: bool = False,
 ) -> dict[str, Any]:
     clean_batch = prepared_batches["forget_clean"]
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=False)
+    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=False, model=model)
 
     record = {
         "pair_id": pair.get("pair_id"),

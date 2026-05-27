@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import torch
 from torch import nn
@@ -13,6 +13,8 @@ from transformers import get_scheduler
 from causal_mip.interventions.hooks import get_module
 from causal_mip.path_localization.path_schema import CandidatePath
 from partial_linear import PartialLinear
+
+ProjectorEditMode = Literal["skip", "qwen_merger_mlp"]
 
 
 @dataclass
@@ -24,6 +26,9 @@ class PathNeuronMask:
     shared_neurons: set[int] = field(default_factory=set)
     forget_path_ids: set[str] = field(default_factory=set)
     shared_path_ids: set[str] = field(default_factory=set)
+    trace_module: str | None = None
+    trace_kind: Literal["input", "output"] = "input"
+    active: bool = False
 
     @property
     def editable_neurons(self) -> set[int]:
@@ -44,6 +49,9 @@ class PathNeuronMask:
             "num_preserve_neurons": len(self.preserve_neurons),
             "forget_path_ids": sorted(self.forget_path_ids),
             "shared_path_ids": sorted(self.shared_path_ids),
+            "trace_module": self.trace_module,
+            "trace_kind": self.trace_kind,
+            "active": self.active,
         }
 
 
@@ -55,7 +63,9 @@ class MaskedRMisUConfig:
     alpha: float = 1.0
     beta: float = 1.0
     shared_alpha: float = 1.0
+    forget_objective: str = "activation_random"
     forget_ce_alpha: float = 0.0
+    projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp"
     steering_coeff: float = 6.5
     coeffs: float = 1.0
     learning_rate: float = 1e-5
@@ -119,6 +129,53 @@ def _patchable_down_proj_kind(module_name: str) -> str | None:
         return "llm"
     if _is_patchable_vision_down_proj(module_name):
         return "vision"
+    if module_name in {
+        "mm_projector",
+        "model.mm_projector",
+        "base_model.model.mm_projector",
+        "visual.merger",
+        "model.visual.merger",
+        "base_model.model.visual.merger",
+        "base_model.model.model.visual.merger",
+    }:
+        return "projector"
+    return None
+
+
+def _resolve_projector_edit_module(
+    model: nn.Module,
+    module_name: str,
+    mode: ProjectorEditMode,
+) -> str | None:
+    if mode == "skip":
+        return None
+    if mode != "qwen_merger_mlp":
+        raise ValueError(f"Unsupported projector_edit_mode: {mode}")
+
+    candidates = [module_name]
+    if module_name == "mm_projector":
+        candidates.extend(
+            [
+                "model.mm_projector",
+                "base_model.model.mm_projector",
+                "visual.merger",
+                "model.visual.merger",
+                "base_model.model.visual.merger",
+                "base_model.model.model.visual.merger",
+            ]
+        )
+
+    for candidate in candidates:
+        try:
+            module = get_module(model, candidate)
+        except KeyError:
+            continue
+        mlp = getattr(module, "mlp", None)
+        if isinstance(mlp, nn.Sequential) and len(mlp) >= 3:
+            if isinstance(mlp[0], nn.Linear) and isinstance(mlp[2], nn.Linear):
+                return f"{candidate}.mlp.0"
+        if isinstance(module, nn.Linear):
+            return candidate
     return None
 
 
@@ -200,6 +257,7 @@ def apply_masked_rmisu_parameter_mask(
     model: nn.Module,
     masks: dict[str, PathNeuronMask],
     strict: bool = False,
+    projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp",
 ) -> dict[str, Any]:
     model.requires_grad_(False)
     summary = {
@@ -214,6 +272,48 @@ def apply_masked_rmisu_parameter_mask(
         if not editable:
             summary["skipped_modules"].append(
                 {"module": down_proj_name, "reason": "no_editable_neurons"}
+            )
+            continue
+        if mask.module_kind == "projector":
+            edit_module_name = _resolve_projector_edit_module(
+                model,
+                down_proj_name,
+                mode=projector_edit_mode,
+            )
+            if edit_module_name is None:
+                reason = (
+                    "projector_editing_disabled"
+                    if projector_edit_mode == "skip"
+                    else "projector_edit_module_not_found"
+                )
+                if strict and projector_edit_mode != "skip":
+                    raise KeyError(f"Projector edit module not found for {down_proj_name}")
+                summary["skipped_modules"].append(
+                    {"module": down_proj_name, "reason": reason}
+                )
+                continue
+            try:
+                linear = get_module(model, edit_module_name)
+                wrapped = _wrap_linear_with_partial(linear, editable)
+                _replace_child_module(model, edit_module_name, wrapped)
+            except (KeyError, TypeError, IndexError):
+                if strict:
+                    raise
+                summary["skipped_modules"].append(
+                    {"module": down_proj_name, "reason": "projector_edit_module_not_patchable"}
+                )
+                continue
+            mask.trace_module = edit_module_name
+            mask.trace_kind = "output"
+            mask.active = True
+            summary["num_modules"] += 1
+            summary["num_editable_neurons"] += len(editable)
+            summary["modules"].append(
+                {
+                    **mask.to_summary(),
+                    "editable_neurons": editable,
+                    "edit_module": edit_module_name,
+                }
             )
             continue
         mlp_name = _parent_module_name(down_proj_name)
@@ -237,10 +337,12 @@ def apply_masked_rmisu_parameter_mask(
 
         summary["num_modules"] += 1
         summary["num_editable_neurons"] += len(editable)
+        mask.active = True
         summary["modules"].append(
             {
                 **mask.to_summary(),
                 "editable_neurons": editable,
+                "edit_module": down_proj_name,
             }
         )
 
@@ -289,12 +391,15 @@ class DownProjInputTracer:
 
     def __enter__(self):
         for module_name, mask in sorted(self.masks.items()):
+            if not mask.active:
+                continue
             neurons = self._neurons_for_mask(mask)
             if not neurons:
                 continue
-            module = get_module(self.model, module_name)
+            trace_module_name = mask.trace_module or module_name
+            module = get_module(self.model, trace_module_name)
 
-            def hook(current_module, inputs, module_name=module_name, neurons=neurons):
+            def pre_hook(current_module, inputs, module_name=module_name, neurons=neurons):
                 tensor = inputs[0] if isinstance(inputs, tuple) else inputs
                 selected = tensor[..., neurons]
                 if self.detach:
@@ -302,7 +407,18 @@ class DownProjInputTracer:
                 self.activations[module_name] = selected
                 return None
 
-            self.handles.append(module.register_forward_pre_hook(hook))
+            def forward_hook(current_module, inputs, output, module_name=module_name, neurons=neurons):
+                tensor = output[0] if isinstance(output, tuple) else output
+                selected = tensor[..., neurons]
+                if self.detach:
+                    selected = selected.detach()
+                self.activations[module_name] = selected
+                return None
+
+            if mask.trace_kind == "output":
+                self.handles.append(module.register_forward_hook(forward_hook))
+            else:
+                self.handles.append(module.register_forward_pre_hook(pre_hook))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -380,6 +496,19 @@ def _activation_preserve_loss(
     return torch.stack(losses).mean()
 
 
+def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
+    allowed = {"activation_random", "ce_ascent", "activation_random_ce"}
+    if config.forget_objective not in allowed:
+        raise ValueError(
+            f"Unsupported forget_objective={config.forget_objective}. "
+            f"Expected one of {sorted(allowed)}."
+        )
+    if config.forget_objective in {"ce_ascent", "activation_random_ce"} and config.forget_ce_alpha <= 0.0:
+        raise ValueError(
+            f"forget_objective={config.forget_objective} requires forget_ce_alpha > 0"
+        )
+
+
 def masked_rmisu_finetune(
     updated_model: nn.Module,
     frozen_model: nn.Module | None,
@@ -387,12 +516,17 @@ def masked_rmisu_finetune(
     forget_loader,
     config: MaskedRMisUConfig,
 ) -> tuple[nn.Module, dict[str, Any]]:
+    _validate_forget_objective(config)
     masks = build_path_neuron_masks(
         candidate_paths_path=config.candidate_paths_path,
         p_forget_path=config.p_forget_path,
         p_shared_path=config.p_shared_path,
     )
-    mask_summary = apply_masked_rmisu_parameter_mask(updated_model, masks)
+    mask_summary = apply_masked_rmisu_parameter_mask(
+        updated_model,
+        masks,
+        projector_edit_mode=config.projector_edit_mode,
+    )
     trainable_params = [param for param in updated_model.parameters() if param.requires_grad]
     if not trainable_params:
         raise ValueError("No trainable parameters after applying masked RMisU parameter mask")
@@ -422,13 +556,16 @@ def masked_rmisu_finetune(
 
             with DownProjInputTracer(updated_model, masks, neuron_kind="editable", detach=False) as forget_trace:
                 forget_output = _forward_batch(updated_model, forget_batch)
-            unlearn_loss = _activation_mse_to_random(
-                forget_trace.activations,
-                steering_coeff=config.steering_coeff,
-                coeffs=config.coeffs,
-            )
+            if config.forget_objective in {"activation_random", "activation_random_ce"}:
+                unlearn_loss = _activation_mse_to_random(
+                    forget_trace.activations,
+                    steering_coeff=config.steering_coeff,
+                    coeffs=config.coeffs,
+                )
+            else:
+                unlearn_loss = torch.tensor(0.0, device=_model_device(updated_model))
             forget_ce_loss = torch.tensor(0.0, device=_model_device(updated_model))
-            if config.forget_ce_alpha != 0.0:
+            if config.forget_ce_alpha != 0.0 or config.forget_objective == "ce_ascent":
                 forget_ce_loss = forget_output.loss.to(_model_device(updated_model))
 
             retain_loss = torch.tensor(0.0, device=_model_device(updated_model))
@@ -476,6 +613,7 @@ def masked_rmisu_finetune(
                 "loss": float(loss.detach().cpu().item()),
                 "unlearn_loss": float(unlearn_loss.detach().cpu().item()),
                 "forget_ce_loss": float(forget_ce_loss.detach().cpu().item()),
+                "forget_objective": config.forget_objective,
                 "retain_loss": float(retain_loss.detach().cpu().item()),
                 "shared_loss": float(shared_loss.detach().cpu().item()),
             }

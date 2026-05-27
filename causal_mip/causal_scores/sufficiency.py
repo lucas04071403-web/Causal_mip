@@ -12,6 +12,25 @@ from causal_mip.interventions.restoration import restore_path_activations
 from causal_mip.path_localization.path_schema import CandidatePath
 
 
+def _target_token_diagnostics(batch: PreparedSampleBatch) -> dict[str, Any]:
+    answer_positions = [position for position in batch.answer_token_positions if position > 0]
+    token_ids = []
+    score_positions = []
+    for answer_position in answer_positions:
+        score_position = answer_position - 1
+        if score_position < 0 or score_position >= batch.input_ids.shape[1] - 1:
+            continue
+        score_positions.append(score_position)
+        token_ids.append(int(batch.input_ids[0, answer_position].detach().cpu().item()))
+    return {
+        "target_answer_text": batch.target_answer_text,
+        "answer_token_positions": list(batch.answer_token_positions),
+        "score_positions": score_positions,
+        "answer_token_ids": token_ids,
+        "prompt_length": batch.prompt_length,
+    }
+
+
 def compute_sufficiency(
     model,
     clean_batch: PreparedSampleBatch,
@@ -19,7 +38,7 @@ def compute_sufficiency(
     candidate_path: CandidatePath,
     strict: bool = False,
 ) -> dict[str, Any]:
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=strict)
+    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=strict, model=model)
     if not resolved_nodes:
         return {
             "status": "no_patchable_nodes",
@@ -51,6 +70,18 @@ def compute_sufficiency(
     restored_score = float(
         compute_target_answer_logprob(restored_outputs.logits.detach(), corrupt_batch).detach().cpu().item()
     )
+    restored_nodes = [
+        {
+            "module": node.module,
+            "layer": node.layer,
+            "neuron": node.neuron,
+            "token_selector": node.token_selector,
+            "module_kind": node.module_kind,
+            "clean_token_positions": list(node.token_positions),
+            "num_restored_tokens": int(node.values.numel()),
+        }
+        for node in cached_path.nodes
+    ]
 
     return {
         "status": "ok",
@@ -59,4 +90,7 @@ def compute_sufficiency(
         "corrupt_score": corrupt_score,
         "restored_score": restored_score,
         "sufficiency": restored_score - corrupt_score,
+        "clean_target": _target_token_diagnostics(clean_batch),
+        "corrupt_target": _target_token_diagnostics(corrupt_batch),
+        "restored_nodes": restored_nodes,
     }

@@ -9,6 +9,7 @@ import torch
 from causal_mip.interventions.hooks import TraceDict
 
 ALL_VISUAL_TOKEN_POSITIONS = [-1]
+WHOLE_VECTOR_NEURON = -1
 
 
 @dataclass
@@ -47,6 +48,12 @@ def _expand_token_positions(token_positions: list[int], tensor: torch.Tensor) ->
 
 
 def _select_neuron_tokens(tensor: torch.Tensor, token_positions: list[int], neuron: int) -> torch.Tensor:
+    if neuron == WHOLE_VECTOR_NEURON:
+        if tensor.ndim == 3:
+            return tensor[:, token_positions, :]
+        if tensor.ndim == 2:
+            return tensor[token_positions, :]
+        raise ValueError(f"Unsupported activation rank for patching: ndim={tensor.ndim}")
     if tensor.ndim == 3:
         return tensor[:, token_positions, neuron]
     if tensor.ndim == 2:
@@ -60,6 +67,14 @@ def _assign_neuron_tokens(
     neuron: int,
     values: torch.Tensor | float,
 ) -> None:
+    if neuron == WHOLE_VECTOR_NEURON:
+        if tensor.ndim == 3:
+            tensor[:, token_positions, :] = values
+            return
+        if tensor.ndim == 2:
+            tensor[token_positions, :] = values
+            return
+        raise ValueError(f"Unsupported activation rank for patching: ndim={tensor.ndim}")
     if tensor.ndim == 3:
         tensor[:, token_positions, neuron] = values
         return

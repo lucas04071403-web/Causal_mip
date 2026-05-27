@@ -72,11 +72,13 @@ class ToyWrapper(nn.Module):
         super().__init__()
         self.language_model = ToyLanguageModel(hidden_size, intermediate_size, num_layers)
         self.visual = ToyVisionModel(hidden_size, intermediate_size, num_layers)
+        self.mm_projector = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, hidden_states, pixel_values=None):
         if pixel_values is not None and pixel_values.ndim == 2:
             visual_states = self.visual(pixel_values)
-            hidden_states = hidden_states + visual_states.mean(dim=0).view(1, 1, -1)
+            projected_states = self.mm_projector(visual_states)
+            hidden_states = hidden_states + projected_states.mean(dim=0).view(1, 1, -1)
         return self.language_model(hidden_states)
 
 
@@ -128,6 +130,15 @@ def _vision_node(layer, neuron):
     return {
         "module": f"model.visual.blocks.{layer}.mlp.down_proj",
         "layer": layer,
+        "neuron": neuron,
+        "token_selector": "image_tokens",
+    }
+
+
+def _projector_node(neuron=0):
+    return {
+        "module": "mm_projector",
+        "layer": None,
         "neuron": neuron,
         "token_selector": "image_tokens",
     }
@@ -214,6 +225,105 @@ def test_vision_mask_build_and_parameter_wrap():
         assert isinstance(language_mlp.up_proj, PartialLinear)
 
 
+def test_projector_mask_is_reported_and_skipped():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(
+            candidates_path,
+            [
+                _candidate("projector_forget_path", [_projector_node(0), _node(1, 3)]),
+            ],
+        )
+        _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        masks = build_path_neuron_masks(str(candidates_path), str(p_forget_path), str(p_shared_path))
+        assert masks["mm_projector"].module_kind == "projector"
+        assert masks["mm_projector"].editable_neurons == {0}
+
+        model = ToyModel()
+        summary = apply_masked_rmisu_parameter_mask(model, masks, projector_edit_mode="skip")
+        skipped = {item["module"]: item["reason"] for item in summary["skipped_modules"]}
+        assert skipped["mm_projector"] == "projector_editing_disabled"
+        assert summary["num_modules"] == 1
+
+
+def test_projector_linear_mask_build_and_parameter_wrap():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(
+            candidates_path,
+            [
+                _candidate("projector_forget_path", [_projector_node(3), _node(1, 4)]),
+                _candidate("projector_shared_path", [_projector_node(5)]),
+            ],
+        )
+        _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
+        _write_jsonl(p_shared_path, [{"path_id": "projector_shared_path"}])
+
+        masks = build_path_neuron_masks(str(candidates_path), str(p_forget_path), str(p_shared_path))
+        model = ToyModel()
+        summary = apply_masked_rmisu_parameter_mask(model, masks)
+        projector_summary = {
+            item["module"]: item
+            for item in summary["modules"]
+            if item["module"] == "mm_projector"
+        }["mm_projector"]
+        assert projector_summary["edit_module"] == "model.mm_projector"
+        assert projector_summary["trace_module"] == "model.mm_projector"
+        assert projector_summary["trace_kind"] == "output"
+        assert projector_summary["active"] is True
+        assert isinstance(model.model.mm_projector, PartialLinear)
+        assert model.model.mm_projector.trainable_cols == [3]
+
+
+def test_projector_activation_objective_updates_projector_weights():
+    torch.manual_seed(19)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("projector_forget_path", [_projector_node(3)])])
+        _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        original_weight = updated_model.model.mm_projector.weight.detach().clone()
+        retain_loader = [_vision_batch(0)]
+        forget_loader = [_vision_batch(2)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.1,
+            shared_alpha=0.0,
+            learning_rate=1e-2,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            config=config,
+        )
+        merged = updated_model.model.mm_projector.merge_to_linear()
+        assert summary["mask_summary"]["modules"][0]["trace_kind"] == "output"
+        assert not torch.equal(merged.weight.detach()[3], original_weight[3])
+        unchanged_rows = [idx for idx in range(original_weight.shape[0]) if idx != 3]
+        assert torch.allclose(merged.weight.detach()[unchanged_rows], original_weight[unchanged_rows])
+
+
 def test_masked_rmisu_finetune_smoke():
     torch.manual_seed(7)
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -259,10 +369,54 @@ def test_masked_rmisu_finetune_smoke():
         assert output_path.exists()
 
 
+def test_masked_rmisu_ce_ascent_objective_smoke():
+    torch.manual_seed(11)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("forget_path", [_node(0, 2)])])
+        _write_jsonl(p_forget_path, [{"path_id": "forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        retain_loader = [_batch(0)]
+        forget_loader = [_batch(2)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.0,
+            shared_alpha=0.0,
+            forget_objective="ce_ascent",
+            forget_ce_alpha=0.1,
+            learning_rate=1e-4,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            config=config,
+        )
+        assert summary["num_loss_records"] == 1
+        assert summary["losses"][0]["forget_objective"] == "ce_ascent"
+        assert summary["losses"][0]["forget_ce_loss"] != 0.0
+
+
 def main():
     test_mask_build_and_parameter_wrap()
     test_vision_mask_build_and_parameter_wrap()
+    test_projector_mask_is_reported_and_skipped()
+    test_projector_linear_mask_build_and_parameter_wrap()
+    test_projector_activation_objective_updates_projector_weights()
     test_masked_rmisu_finetune_smoke()
+    test_masked_rmisu_ce_ascent_objective_smoke()
     print("Step 7 masked RMisU tests passed.")
 
 

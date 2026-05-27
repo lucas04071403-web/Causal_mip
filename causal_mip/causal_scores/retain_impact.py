@@ -26,7 +26,7 @@ def compute_retain_impact(
         }
 
     first_batch = next(iter(retain_batches.values()))
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, first_batch, strict=strict)
+    resolved_nodes = resolve_candidate_path_targets(candidate_path, first_batch, strict=strict, model=model)
     if not resolved_nodes:
         return {
             "status": "no_patchable_nodes",

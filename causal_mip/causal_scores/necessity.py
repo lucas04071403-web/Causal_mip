@@ -17,7 +17,7 @@ def compute_necessity(
     candidate_path: CandidatePath,
     strict: bool = False,
 ) -> dict[str, Any]:
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=strict)
+    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=strict, model=model)
     if not resolved_nodes:
         return {
             "status": "no_patchable_nodes",

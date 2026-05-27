@@ -904,7 +904,7 @@ causal path selective editing
 ```text
 causal_mip/evaluation/__init__.py
 causal_mip/evaluation/step8_final_eval.py
-docs/STEP8_FINAL_EVALUATION_FLOW.md
+docs/STEP2_TO_STEP8_IMPLEMENTATION_SUMMARY.md
 ```
 
 当前评估入口直接消费 Step3 pair 文件：

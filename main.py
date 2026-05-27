@@ -3,6 +3,7 @@ import time
 import torch
 import numpy as np
 import random
+from causal_mip.project_paths import workspace_path, workspace_path_with_sep
 from causal_mip.path_localization import export_candidate_paths_from_cached_scores
 
 import argparse
@@ -38,18 +39,18 @@ unlearning = "our"
 
 
 model = "Qwen2.5-VL-3B-Instruct"
-base_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/"
-llm_directory = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/llms/"
-output_file_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/"
+base_path = workspace_path_with_sep("datasets")
+llm_directory = workspace_path_with_sep("llms")
+output_file_path = workspace_path_with_sep("outputs")
 if "mllmu" in dataset:
-    train_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/MLLMU-Bench/ft_Data/train-00000-of-00001.parquet"
-    fullset_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/MLLMU-Bench/Full_Set/train-00000-of-00001.parquet"
-    test_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/MLLMU-Bench/Test_Set/test-00000-of-00001.parquet"
+    train_path = workspace_path("datasets", "MLLMU-Bench", "ft_Data", "train-00000-of-00001.parquet")
+    fullset_path = workspace_path("datasets", "MLLMU-Bench", "Full_Set", "train-00000-of-00001.parquet")
+    test_path = workspace_path("datasets", "MLLMU-Bench", "Test_Set", "test-00000-of-00001.parquet")
 if "clear" in dataset:
-    train_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/CLEAR/full+tofu/"
-    fullset_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/CLEAR/full/"
-    test_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/CLEAR/test.jsonl"
-path_path = "/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/influential_paths/"
+    train_path = workspace_path_with_sep("datasets", "CLEAR", "full+tofu")
+    fullset_path = workspace_path_with_sep("datasets", "CLEAR", "full")
+    test_path = workspace_path("datasets", "CLEAR", "test.jsonl")
+path_path = workspace_path_with_sep("influential_paths")
 score_llm = "Qwen2-7B-Instruct"
 
 
@@ -91,20 +92,32 @@ parser.add_argument("--use_masked_rmisu", action='store_true', default=False)
 parser.add_argument(
     "--masked_rmisu_candidate_paths",
     type=str,
-    default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/paths/P_cand.jsonl",
+    default=workspace_path("outputs", "paths", "P_cand.jsonl"),
 )
 parser.add_argument(
     "--masked_rmisu_p_forget",
     type=str,
-    default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/paths/step6_v1/P_forget.jsonl",
+    default=workspace_path("outputs", "paths", "step6_v1", "P_forget.jsonl"),
 )
 parser.add_argument(
     "--masked_rmisu_p_shared",
     type=str,
-    default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/paths/step6_v1/P_shared.jsonl",
+    default=workspace_path("outputs", "paths", "step6_v1", "P_shared.jsonl"),
 )
 parser.add_argument("--masked_rmisu_shared_alpha", type=float, default=1.0)
+parser.add_argument(
+    "--masked_rmisu_forget_objective",
+    type=str,
+    default="activation_random",
+    choices=["activation_random", "ce_ascent", "activation_random_ce"],
+)
 parser.add_argument("--masked_rmisu_forget_ce_alpha", type=float, default=0.0)
+parser.add_argument(
+    "--masked_rmisu_projector_edit_mode",
+    type=str,
+    default="qwen_merger_mlp",
+    choices=["qwen_merger_mlp", "skip"],
+)
 parser.add_argument("--masked_rmisu_output", type=str, default=None)
 parser.add_argument("--masked_rmisu_checkpoint_dir", type=str, default=None)
 parser.add_argument("--masked_rmisu_max_steps", type=int, default=None)
@@ -134,7 +147,7 @@ parser.add_argument("--candidate_cross_modal_paths", type=int, default=20)
 parser.add_argument(
     "--candidate_paths_output",
     type=str,
-    default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/paths/P_cand.jsonl",
+    default=workspace_path("outputs", "paths", "P_cand.jsonl"),
 )
 
 args = parser.parse_args()

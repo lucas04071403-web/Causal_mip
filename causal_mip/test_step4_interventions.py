@@ -64,11 +64,13 @@ class ToyWrapper(nn.Module):
         super().__init__()
         self.language_model = ToyLanguageModel(hidden_size, num_layers)
         self.visual = ToyVisionModel(hidden_size, num_layers)
+        self.mm_projector = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, hidden_states, pixel_values=None):
         if pixel_values is not None:
             visual_states = self.visual(pixel_values)
-            hidden_states = hidden_states + visual_states.mean(dim=0).view(1, 1, -1)
+            projected_states = self.mm_projector(visual_states)
+            hidden_states = hidden_states + projected_states.mean(dim=0).view(1, 1, -1)
         return self.language_model(hidden_states)
 
 
@@ -133,16 +135,21 @@ def test_resolve_candidate_path_targets():
         mip_score=1.0,
         nodes=[
             PathNode("model.visual.blocks.0.mlp.down_proj", 0, 1, "image_tokens"),
+            PathNode("mm_projector", None, 0, "image_tokens"),
             PathNode("model.language_model.layers.0.mlp.down_proj", 0, 2, "answer_tokens"),
         ],
     )
-    resolved = resolve_candidate_path_targets(path, batch, strict=False)
-    assert len(resolved) == 2
+    model = ToyModel()
+    resolved = resolve_candidate_path_targets(path, batch, strict=True, model=model)
+    assert len(resolved) == 3
     assert resolved[0].module == "model.visual.blocks.0.mlp.down_proj"
     assert resolved[0].module_kind == "vision"
     assert resolved[0].token_positions == [-1]
-    assert resolved[1].module == "model.language_model.layers.0.mlp.down_proj"
-    assert resolved[1].module_kind == "llm"
+    assert resolved[1].module == "model.mm_projector"
+    assert resolved[1].module_kind == "projector"
+    assert resolved[1].neuron == -1
+    assert resolved[2].module == "model.language_model.layers.0.mlp.down_proj"
+    assert resolved[2].module_kind == "llm"
 
 
 def test_cache_ablate_restore():
@@ -221,10 +228,46 @@ def test_cache_ablate_restore_vision_path():
         assert torch.allclose(traced[node.token_positions, node.neuron], expected)
 
 
+def test_cache_ablate_restore_projector_path():
+    torch.manual_seed(17)
+    model = ToyModel()
+    clean_pixels = torch.randn(5, 8)
+    corrupt_pixels = torch.randn(5, 8)
+    clean_batch = _prepared_batch(torch.tensor([[1, 2, 3, 4]]), pixel_values=clean_pixels)
+    corrupt_batch = _prepared_batch(torch.tensor([[1, 2, 3, 4]]), pixel_values=corrupt_pixels)
+    path = CandidatePath(
+        path_id="toy_projector_path",
+        source="test",
+        modality="vision_text",
+        mip_score=1.0,
+        nodes=[PathNode("mm_projector", None, 0, "image_tokens")],
+    )
+
+    cached = cache_candidate_path_activations(model, clean_batch, path, strict=True)
+    assert len(cached.nodes) == 1
+    assert cached.nodes[0].module == "model.mm_projector"
+    assert cached.nodes[0].module_kind == "projector"
+    assert cached.nodes[0].neuron == -1
+    assert cached.nodes[0].values.shape == (5, 8)
+
+    ablated_outputs, ablated_traces = ablate_candidate_path(model, clean_batch, path, strict=True)
+    ablated_score = compute_target_answer_logprob(ablated_outputs.logits, clean_batch).item()
+    traced = ablated_traces["model.mm_projector"].input
+    assert torch.allclose(traced[cached.nodes[0].token_positions, :], torch.zeros_like(traced[cached.nodes[0].token_positions, :]))
+
+    restored_outputs, restored_traces = restore_path_activations(model, corrupt_batch, cached)
+    restored_score = compute_target_answer_logprob(restored_outputs.logits, corrupt_batch).item()
+    assert restored_score != ablated_score
+    traced = restored_traces["model.mm_projector"].input
+    expected = cached.nodes[0].values.to(device=traced.device, dtype=traced.dtype)
+    assert torch.allclose(traced[cached.nodes[0].token_positions, :], expected)
+
+
 def main():
     test_resolve_candidate_path_targets()
     test_cache_ablate_restore()
     test_cache_ablate_restore_vision_path()
+    test_cache_ablate_restore_projector_path()
     print("Step 4 intervention tests passed.")
 
 

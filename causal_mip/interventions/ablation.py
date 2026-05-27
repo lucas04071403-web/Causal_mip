@@ -9,8 +9,14 @@ def build_zero_ablation_interventions(
     candidate_path: CandidatePath,
     prepared_batch: PreparedSampleBatch,
     strict: bool = False,
+    model=None,
 ) -> list[NodeIntervention]:
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, prepared_batch, strict=strict)
+    resolved_nodes = resolve_candidate_path_targets(
+        candidate_path,
+        prepared_batch,
+        strict=strict,
+        model=model,
+    )
     return [
         NodeIntervention(
             module=node.module,
@@ -33,6 +39,7 @@ def ablate_candidate_path(
         candidate_path=candidate_path,
         prepared_batch=prepared_batch,
         strict=strict,
+        model=model,
     )
     return run_patched_forward(
         model=model,

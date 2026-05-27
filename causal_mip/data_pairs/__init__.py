@@ -2,6 +2,7 @@ from importlib import import_module
 
 __all__ = [
     "build_causal_pairs_for_project",
+    "build_path_pair_bindings",
     "build_pairs_from_samples",
     "build_same_topic_answer",
     "build_same_topic_question",
@@ -16,10 +17,12 @@ def __getattr__(name: str):
     if name in {
         "build_causal_pairs_for_project",
         "build_pairs_from_samples",
+        "build_path_pair_bindings",
         "split_pairs_train_val",
         "write_pairs_jsonl",
     }:
-        module = import_module(f"{__name__}.build_pairs")
+        module_name = "bind_paths_to_pairs" if name == "build_path_pair_bindings" else "build_pairs"
+        module = import_module(f"{__name__}.{module_name}")
         value = getattr(module, name)
         globals()[name] = value
         return value

@@ -18,6 +18,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+from causal_mip.project_paths import workspace_path
 from clear import CLEAR_Clf_Dataset, CLEAR_Gen_Dataset
 from metrics.bleu.bleu import Bleu
 from metrics.rouge.rouge import Rouge
@@ -95,6 +96,7 @@ def build_args_dict(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "model": args.model,
         "model_path": args.model_path,
+        "peft_checkpoint": args.peft_checkpoint,
         "dataset": "clear",
         "forget_ratio": args.forget_ratio,
         "batch_size": args.batch_size,
@@ -466,6 +468,11 @@ def run(args: argparse.Namespace) -> None:
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
+    if args.peft_checkpoint is not None:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, args.peft_checkpoint, is_trainable=False)
+        model = model.merge_and_unload()
     model.to(args.device)
 
     scored_by_task = {}
@@ -482,17 +489,23 @@ def run(args: argparse.Namespace) -> None:
         summary = build_protocol_summary(args, scored_by_task)
         summary_path = output_root / "full_clear_remote_protocol_summary.json"
         write_json(summary_path, summary)
+        if args.output is not None:
+            write_json(args.output, summary)
         print(json.dumps(summary["metrics"], ensure_ascii=False, indent=2))
         print(f"Saved summary: {summary_path}")
+        if args.output is not None:
+            print(f"Saved summary alias: {args.output}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Full CLEAR prediction + resumable remote scoring.")
     parser.add_argument("--model_path", required=True)
+    parser.add_argument("--peft_checkpoint", default=None)
     parser.add_argument("--model", default="Qwen2.5-VL-3B-Instruct")
-    parser.add_argument("--base_path", default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/datasets/")
-    parser.add_argument("--llm_directory", default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/llms/")
-    parser.add_argument("--output_dir", default="/home/lucas/Desktop/CurrentReacher/MIP_fusion7/mip_workspace/outputs/full_clear_remote_eval")
+    parser.add_argument("--base_path", default=workspace_path("datasets"))
+    parser.add_argument("--llm_directory", default=workspace_path("llms"))
+    parser.add_argument("--output_dir", default=workspace_path("outputs", "full_clear_remote_eval"))
+    parser.add_argument("--output", default=None, help="Optional direct copy of full_clear_remote_protocol_summary.json.")
     parser.add_argument("--run_id", default="chip_full_train_0526_1348_full_remote")
     parser.add_argument("--forget_ratio", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=2)

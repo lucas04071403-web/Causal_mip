@@ -1,5 +1,6 @@
 from torch import nn
 import torch
+import torch.nn.functional as F
 from typing_extensions import override
 
 class PartialLinear(nn.Module):
@@ -10,37 +11,28 @@ class PartialLinear(nn.Module):
         self.num_columns = original_linear.out_features
 
         self.trainable_cols = sorted(trainable_cols)
-        self.frozen_cols = [
-            i for i in range(self.num_columns) if i not in trainable_cols
-        ]
-
-        self.trainable_linear = nn.Linear(
-            self.num_rows, len(self.trainable_cols), bias=False
+        self.register_buffer(
+            "trainable_cols_tensor",
+            torch.tensor(self.trainable_cols, dtype=torch.long),
+            persistent=False,
         )
-        self.trainable_linear.weight = nn.Parameter(original_linear.weight[self.trainable_cols, :].clone())
-        self.trainable_linear.requires_grad_(True)
-        self.trainable_linear.to(original_linear.weight.device)
 
-        self.frozen_linear = nn.Linear(
-            self.num_rows, len(self.frozen_cols), bias=False
-        )
-        self.frozen_linear.weight = nn.Parameter(original_linear.weight[self.frozen_cols, :].clone())
-        self.frozen_linear.requires_grad_(False)
-        self.frozen_linear.to(original_linear.weight.device)
+        self.original_linear.requires_grad_(False)
+        self.trainable_weight = nn.Parameter(original_linear.weight[self.trainable_cols, :].clone())
+        if original_linear.bias is None:
+            self.trainable_bias = None
+        else:
+            self.trainable_bias = nn.Parameter(original_linear.bias[self.trainable_cols].clone())
 
         self.is_weight_changed = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
             self.is_weight_changed = True
-            trainable_output = self.trainable_linear(x)
-            frozen_output = self.frozen_linear(x)
-            output = torch.zeros(
-                *x.shape[:-1], self.num_columns, device=x.device, dtype=x.dtype
-            )
-            output[..., self.trainable_cols] = trainable_output
-            output[..., self.frozen_cols] = frozen_output
-            return output
+            frozen_output = self.original_linear(x)
+            trainable_output = F.linear(x, self.trainable_weight, self.trainable_bias)
+            cols = self.trainable_cols_tensor.to(device=x.device)
+            return frozen_output.index_copy(frozen_output.dim() - 1, cols, trainable_output)
         else:
             if self.is_weight_changed:
                 self.merge_to_linear()
@@ -50,8 +42,8 @@ class PartialLinear(nn.Module):
     def merge_to_linear(self):
         """Merge the trainable and frozen parts back into the original linear layer."""
         with torch.no_grad():
-            self.original_linear.weight[self.trainable_cols, :] = self.trainable_linear.weight
-            self.original_linear.weight[self.frozen_cols, :] = self.frozen_linear.weight
+            self.original_linear.weight[self.trainable_cols, :] = self.trainable_weight
+            if self.original_linear.bias is not None and self.trainable_bias is not None:
+                self.original_linear.bias[self.trainable_cols] = self.trainable_bias
         return self.original_linear
-
 

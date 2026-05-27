@@ -34,6 +34,8 @@ class CandidatePath:
     modality: str          # "vision" | "text" | "vision_text"
     mip_score: float      # Original MIP score (IGI or Fisher)
     nodes: list[PathNode] = field(default_factory=list)
+    source_sample_idx: Optional[int] = None
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -41,13 +43,17 @@ class CandidatePath:
             "source": self.source,
             "modality": self.modality,
             "mip_score": self.mip_score,
-            "nodes": [n.to_dict() for n in self.nodes]
+            "nodes": [n.to_dict() for n in self.nodes],
+            "source_sample_idx": self.source_sample_idx,
+            "metadata": self.metadata,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> 'CandidatePath':
         data = data.copy()
         data['nodes'] = [PathNode.from_dict(n) for n in data['nodes']]
+        data.setdefault("source_sample_idx", None)
+        data.setdefault("metadata", {})
         return cls(**data)
 
     def to_json(self) -> str:

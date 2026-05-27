@@ -9,6 +9,7 @@ from causal_mip.causal_scores.metrics import (
     filter_candidate_paths_for_step5,
     write_path_score_records_jsonl,
 )
+from causal_mip.data_pairs.bind_paths_to_pairs import load_path_pair_bindings
 from causal_mip.interventions.activation_cache import (
     SampleReferenceResolver,
     load_candidate_paths_jsonl,
@@ -35,6 +36,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pair_start", type=int, default=0)
     parser.add_argument("--path_start", type=int, default=0)
     parser.add_argument("--path_modality", type=str, default="all", choices=["all", "text", "vision_text", "vision"])
+    parser.add_argument("--path_pair_bindings", type=str, default=None)
     parser.add_argument("--strict_patchable", action="store_true", default=False)
     return parser
 
@@ -82,10 +84,20 @@ def main() -> None:
     candidate_paths = filter_candidate_paths_for_step5(candidate_paths, modality_filter=args.path_modality)
     pairs = _slice_records(pairs, args.pair_start, args.num_pairs)
     candidate_paths = _slice_records(candidate_paths, args.path_start, args.num_paths)
+    candidate_paths_by_id = {path.path_id: path for path in candidate_paths}
+    bindings = load_path_pair_bindings(args.path_pair_bindings) if args.path_pair_bindings else None
 
     resolver = SampleReferenceResolver()
     records = []
     for pair in pairs:
+        pair_candidate_paths = candidate_paths
+        if bindings is not None:
+            allowed_path_ids = bindings.get(pair.get("pair_id"), set())
+            pair_candidate_paths = [
+                candidate_paths_by_id[path_id]
+                for path_id in sorted(allowed_path_ids)
+                if path_id in candidate_paths_by_id
+            ]
         prepared_batches = build_pair_prepared_batches(
             pair=pair,
             processor=processor,
@@ -93,7 +105,7 @@ def main() -> None:
             image_resize=args.image_resize,
             resolver=resolver,
         )
-        for candidate_path in candidate_paths:
+        for candidate_path in pair_candidate_paths:
             records.append(
                 compute_path_causal_score_record(
                     model=model,
@@ -109,6 +121,7 @@ def main() -> None:
         "num_pairs": len(pairs),
         "num_paths": len(candidate_paths),
         "num_records": len(records),
+        "path_pair_bindings": args.path_pair_bindings,
         "output_path": args.output,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

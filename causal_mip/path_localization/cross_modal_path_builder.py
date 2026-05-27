@@ -252,6 +252,14 @@ def build_cross_modal_paths_from_unimodal_paths(
             modality="vision_text",
             mip_score=(vision_path.mip_score + text_path.mip_score) / 2.0,
             nodes=nodes,
+            source_sample_idx=vision_path.source_sample_idx,
+            metadata={
+                "vision_path_id": vision_path.path_id,
+                "text_path_id": text_path.path_id,
+                "vision_source_sample_idx": vision_path.source_sample_idx,
+                "text_source_sample_idx": text_path.source_sample_idx,
+                "source_sample_idx": vision_path.source_sample_idx,
+            },
         ))
 
     return candidate_paths

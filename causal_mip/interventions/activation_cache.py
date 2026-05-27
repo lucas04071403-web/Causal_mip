@@ -9,10 +9,12 @@ from typing import Any, Literal
 from PIL import Image
 import torch
 
-from causal_mip.interventions.hooks import TraceDict
+from causal_mip.interventions.hooks import TraceDict, get_module
 from causal_mip.path_localization.path_schema import CandidatePath
 
 ALL_VISUAL_TOKEN_POSITIONS = [-1]
+WHOLE_VECTOR_NEURON = -1
+ModuleKind = Literal["llm", "vision", "projector"]
 
 
 def _import_pyarrow():
@@ -93,7 +95,7 @@ class ResolvedPathNode:
     neuron: int
     token_selector: str
     token_positions: list[int]
-    module_kind: Literal["llm", "vision"] = "llm"
+    module_kind: ModuleKind = "llm"
 
 
 @dataclass
@@ -104,7 +106,7 @@ class CachedNodeActivation:
     token_selector: str
     token_positions: list[int]
     values: torch.Tensor
-    module_kind: Literal["llm", "vision"] = "llm"
+    module_kind: ModuleKind = "llm"
 
 
 @dataclass
@@ -338,11 +340,47 @@ def _is_patchable_vision_module(module_name: str) -> bool:
     return module_name.startswith(allowed_prefixes) and module_name.endswith(".mlp.down_proj")
 
 
-def _get_patchable_module_kind(module_name: str) -> Literal["llm", "vision"] | None:
+def _is_projector_module(module_name: str) -> bool:
+    return module_name in {
+        "mm_projector",
+        "model.mm_projector",
+        "base_model.model.mm_projector",
+        "visual.merger",
+        "model.visual.merger",
+        "base_model.model.visual.merger",
+        "base_model.model.model.visual.merger",
+    }
+
+
+def _resolve_projector_module_name(model, module_name: str) -> str | None:
+    candidates = [module_name]
+    if module_name == "mm_projector":
+        candidates.extend(
+            [
+                "model.mm_projector",
+                "base_model.model.mm_projector",
+                "visual.merger",
+                "model.visual.merger",
+                "base_model.model.visual.merger",
+                "base_model.model.model.visual.merger",
+            ]
+        )
+    for candidate in candidates:
+        try:
+            get_module(model, candidate)
+            return candidate
+        except KeyError:
+            continue
+    return None
+
+
+def _get_patchable_module_kind(module_name: str) -> ModuleKind | None:
     if _is_patchable_llm_module(module_name):
         return "llm"
     if _is_patchable_vision_module(module_name):
         return "vision"
+    if _is_projector_module(module_name):
+        return "projector"
     return None
 
 
@@ -359,6 +397,7 @@ def resolve_candidate_path_targets(
     candidate_path: CandidatePath,
     prepared_batch: PreparedSampleBatch,
     strict: bool = False,
+    model=None,
 ) -> list[ResolvedPathNode]:
     resolved: list[ResolvedPathNode] = []
     for node in candidate_path.nodes:
@@ -367,7 +406,18 @@ def resolve_candidate_path_targets(
             if strict:
                 raise ValueError(f"Unsupported Step 4 module in MVP path patching: {node.module}")
             continue
-        if module_kind == "vision" and node.token_selector == "image_tokens":
+        resolved_module = node.module
+        neuron = node.neuron
+        if module_kind == "projector":
+            neuron = WHOLE_VECTOR_NEURON
+            if model is not None:
+                resolved_projector = _resolve_projector_module_name(model, node.module)
+                if resolved_projector is None:
+                    if strict:
+                        raise ValueError(f"Projector module not found for path node: {node.module}")
+                    continue
+                resolved_module = resolved_projector
+        if module_kind in {"vision", "projector"} and node.token_selector == "image_tokens":
             token_positions = list(ALL_VISUAL_TOKEN_POSITIONS)
         else:
             token_positions = resolve_token_positions(prepared_batch, node.token_selector)
@@ -379,9 +429,9 @@ def resolve_candidate_path_targets(
             continue
         resolved.append(
             ResolvedPathNode(
-                module=node.module,
+                module=resolved_module,
                 layer=node.layer,
-                neuron=node.neuron,
+                neuron=neuron,
                 token_selector=node.token_selector,
                 token_positions=token_positions,
                 module_kind=module_kind,
@@ -422,7 +472,12 @@ def cache_candidate_path_activations(
     strict: bool = False,
     no_grad: bool = True,
 ) -> CachedPathActivations:
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, prepared_batch, strict=strict)
+    resolved_nodes = resolve_candidate_path_targets(
+        candidate_path,
+        prepared_batch,
+        strict=strict,
+        model=model,
+    )
     trace_layers = [node.module for node in resolved_nodes]
 
     if no_grad:
@@ -439,7 +494,16 @@ def cache_candidate_path_activations(
     for node in resolved_nodes:
         module_input = _untuple(traces[node.module].input)
         token_positions = _expand_token_positions_for_tensor(node.token_positions, module_input)
-        if module_input.ndim == 3:
+        if node.neuron == WHOLE_VECTOR_NEURON:
+            if module_input.ndim == 3:
+                activation_slice = module_input[:, token_positions, :].detach().cpu()
+            elif module_input.ndim == 2:
+                activation_slice = module_input[token_positions, :].detach().cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported activation rank for {node.module}: ndim={module_input.ndim}"
+                )
+        elif module_input.ndim == 3:
             activation_slice = module_input[:, token_positions, node.neuron].detach().cpu()
         elif module_input.ndim == 2:
             activation_slice = module_input[token_positions, node.neuron].detach().cpu()
