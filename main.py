@@ -104,14 +104,32 @@ parser.add_argument(
     type=str,
     default=workspace_path("outputs", "paths", "step6_v1", "P_shared.jsonl"),
 )
+parser.add_argument("--masked_rmisu_p_probe", type=str, default=None)
 parser.add_argument("--masked_rmisu_shared_alpha", type=float, default=1.0)
+parser.add_argument("--masked_rmisu_probe_beta", type=float, default=0.05)
+parser.add_argument("--masked_rmisu_probe_steering_coeff", type=float, default=1.0)
+parser.add_argument("--masked_rmisu_probe_coeffs", type=float, default=1.0)
 parser.add_argument(
     "--masked_rmisu_forget_objective",
     type=str,
     default="activation_random",
-    choices=["activation_random", "ce_ascent", "activation_random_ce"],
+    choices=[
+        "activation_random",
+        "ce_ascent",
+        "answer_ce_ascent",
+        "name_ce_ascent",
+        "activation_random_ce",
+        "activation_random_answer_ce",
+        "activation_random_name_ce",
+    ],
 )
 parser.add_argument("--masked_rmisu_forget_ce_alpha", type=float, default=0.0)
+parser.add_argument(
+    "--masked_rmisu_target_ce_scope",
+    type=str,
+    default="all",
+    choices=["all", "answer", "name"],
+)
 parser.add_argument(
     "--masked_rmisu_projector_edit_mode",
     type=str,

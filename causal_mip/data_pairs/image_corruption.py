@@ -7,12 +7,29 @@ def build_corrupt_index(samples: list[dict[str, Any]]) -> dict[Any, dict[str, An
     return {sample.get("id"): sample for sample in samples}
 
 
+def _looks_like_same_prompt_image(clean_sample: dict[str, Any], corrupt_sample: dict[str, Any]) -> bool:
+    """Detect perturbation rows that change only labels/captions, not model inputs."""
+    clean_ref = clean_sample.get("image_ref") or {}
+    corrupt_ref = corrupt_sample.get("image_ref") or {}
+    same_question = (clean_sample.get("question") or "") == (corrupt_sample.get("question") or clean_sample.get("question") or "")
+    same_dataset = clean_ref.get("dataset_path") == corrupt_ref.get("dataset_path")
+    same_item = clean_sample.get("id") == corrupt_sample.get("id")
+    same_row = clean_sample.get("row_idx") == corrupt_sample.get("row_idx")
+    same_ref_item = clean_ref.get("item_id") == corrupt_ref.get("item_id")
+    same_ref_row = clean_ref.get("row_idx") == corrupt_ref.get("row_idx")
+    same_path = clean_ref.get("image_path") is not None and clean_ref.get("image_path") == corrupt_ref.get("image_path")
+    return same_question and (same_path or (same_dataset and ((same_item and same_row) or (same_ref_item and same_ref_row))))
+
+
 def select_explicit_corruption(clean_sample: dict[str, Any], corrupt_index: dict[Any, dict[str, Any]]) -> dict[str, Any] | None:
     sample_id = clean_sample.get("id")
     if sample_id not in corrupt_index:
         return None
 
     corrupt_sample = corrupt_index[sample_id]
+    if _looks_like_same_prompt_image(clean_sample, corrupt_sample):
+        return None
+
     corrupt_answer = corrupt_sample.get("caption") or corrupt_sample.get("answer") or "unknown"
     return {
         "type": "image_corrupt",

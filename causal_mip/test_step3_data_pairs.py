@@ -54,6 +54,37 @@ def main():
     assert pairs[1]["forget_corrupt"]["corruption_type"] in {"semantic_minimal_pair", "symmetric_token_replacement"}
     assert pairs[0]["hard_retain"][0]["type"] == "same_topic"
     assert pairs[0]["counterfactual_retain"]["type"] == "counterfactual_retain"
+
+    same_input_corrupt = [
+        {
+            **_sample(
+                1,
+                "What can you see in this image?",
+                "Alice is shown with books.",
+                "Carol is shown with flowers.",
+                "Alice",
+                "clear_corrupt",
+            ),
+            "image_ref": {
+                "dataset_path": "/tmp/mock",
+                "row_idx": 1,
+                "item_id": 1,
+                "image_path": None,
+                "has_bytes": False,
+            },
+        }
+    ]
+    same_input_pairs = build_pairs_from_samples(
+        forget_clean_samples=forget_clean[:1],
+        retain_clean_samples=retain_clean,
+        forget_corrupt_samples=same_input_corrupt,
+        max_pairs=1,
+        seed=7,
+    )
+    assert same_input_pairs[0]["forget_corrupt"]["corruption_type"] in {
+        "semantic_minimal_pair",
+        "symmetric_token_replacement",
+    }
     print("Step 3 data-pair tests passed.")
 
 

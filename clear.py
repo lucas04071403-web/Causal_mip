@@ -54,6 +54,40 @@ def pad_sequence(sequences, padding_side='right', padding_value=0):
     return output
 
 
+def _tokenize_without_special_tokens(tokenizer, text):
+    if not text:
+        return []
+    return tokenizer(text, add_special_tokens=False, padding=False, return_tensors="pt")[
+        "input_ids"
+    ][0].tolist()
+
+
+def _find_subsequence(sequence, subsequence):
+    if not subsequence or len(subsequence) > len(sequence):
+        return []
+    window = len(subsequence)
+    for start in range(len(sequence) - window, -1, -1):
+        if sequence[start : start + window] == subsequence:
+            return list(range(start, start + window))
+    return []
+
+
+def _target_token_metadata(tokenizer, input_ids, labels, item, answer):
+    item = dict(item)
+    active_positions = torch.nonzero(labels != IGNORE_INDEX, as_tuple=False).squeeze(-1).tolist()
+
+    answer_token_ids = _tokenize_without_special_tokens(tokenizer, answer)
+    answer_positions = _find_subsequence(input_ids.tolist(), answer_token_ids)
+    item["answer_token_positions"] = answer_positions or active_positions
+
+    name_token_ids = _tokenize_without_special_tokens(tokenizer, item.get("name"))
+    name_positions = _find_subsequence(input_ids.tolist(), name_token_ids)
+    answer_position_set = set(item["answer_token_positions"])
+    answer_name_positions = [position for position in name_positions if position in answer_position_set]
+    item["name_token_positions"] = answer_name_positions or name_positions
+    return item
+
+
 class CLEAR_Dataset(Dataset):
     def __init__(self, data_path, processor, image_resize, model_name, train=True):
         self.processor = processor
@@ -80,6 +114,7 @@ class CLEAR_Dataset(Dataset):
         item_list = []
         chats = []
         images = []
+        kept_items = []
 
         start_by_multimodal_data = False
         for item in batch:
@@ -114,6 +149,7 @@ class CLEAR_Dataset(Dataset):
             ]
             text = self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
             chats.append(text)
+            kept_items.append(item)
             if image:
                 images.append([image])
             else:
@@ -128,6 +164,20 @@ class CLEAR_Dataset(Dataset):
         labels = batch["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = IGNORE_INDEX
         batch["labels"] = labels
+        input_ids = batch["input_ids"]
+        for row_idx, item in enumerate(kept_items):
+            answer = item.get("answer")
+            if answer is None:
+                answer = item.get("caption", "")
+            item_list.append(
+                _target_token_metadata(
+                    self.processor.tokenizer,
+                    input_ids[row_idx],
+                    labels[row_idx],
+                    item,
+                    answer,
+                )
+            )
         # return batch["input_ids"], batch["attention_mask"], batch["pixel_values"], batch["image_grid_thw"], batch["labels"], item_list
         if "llava" in self.model_name:
             return batch["input_ids"], batch["attention_mask"], batch["pixel_values"], batch["labels"], item_list
@@ -136,9 +186,11 @@ class CLEAR_Dataset(Dataset):
 
 
     def collate_text(self, batch):
+        raw_items = list(batch)
         texts = []
         item_list = []
-        for item in batch:
+        answers = []
+        for item in raw_items:
             question = item.get("question","")
             if question == None:
                 question = random.choice(image_caption_questions)
@@ -146,6 +198,7 @@ class CLEAR_Dataset(Dataset):
             answer = item.get("answer", None)
             if answer == None:
                 answer = caption
+            answers.append(answer)
             caption = item.get("caption","")
             conversation = [
                 {
@@ -162,11 +215,22 @@ class CLEAR_Dataset(Dataset):
             text = self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
             texts.append(text)
 
-        batch = self.processor(text=texts, padding=True, return_tensors="pt")
-        labels = batch["input_ids"].clone()
+        model_batch = self.processor(text=texts, padding=True, return_tensors="pt")
+        labels = model_batch["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = IGNORE_INDEX
-        batch["labels"] = labels
-        return batch["input_ids"], batch["attention_mask"], batch["labels"], item_list
+        model_batch["labels"] = labels
+        input_ids = model_batch["input_ids"]
+        for row_idx, item in enumerate(raw_items):
+            item_list.append(
+                _target_token_metadata(
+                    self.processor.tokenizer,
+                    input_ids[row_idx],
+                    labels[row_idx],
+                    item,
+                    answers[row_idx],
+                )
+            )
+        return model_batch["input_ids"], model_batch["attention_mask"], model_batch["labels"], item_list
 
 class CLEAR_Clf_Dataset(Dataset):
     def __init__(self, data_path, processor, image_resize, train=True):

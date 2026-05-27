@@ -463,12 +463,16 @@ def run(args: argparse.Namespace) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     processor = AutoProcessor.from_pretrained(args.model_path, padding_side="left")
+    checkpoint = Path(args.peft_checkpoint) if args.peft_checkpoint is not None else None
+    full_checkpoint = checkpoint is not None and (checkpoint / "config.json").exists()
+    adapter_checkpoint = checkpoint is not None and (checkpoint / "adapter_config.json").exists()
+    load_path = str(checkpoint) if full_checkpoint and not adapter_checkpoint else args.model_path
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_path,
+        load_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
-    if args.peft_checkpoint is not None:
+    if adapter_checkpoint:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, args.peft_checkpoint, is_trainable=False)

@@ -24,6 +24,7 @@ def _target_token_diagnostics(batch: PreparedSampleBatch) -> dict[str, Any]:
         token_ids.append(int(batch.input_ids[0, answer_position].detach().cpu().item()))
     return {
         "target_answer_text": batch.target_answer_text,
+        "step5_corrupt_source": batch.sample.get("step5_corrupt_source"),
         "answer_token_positions": list(batch.answer_token_positions),
         "score_positions": score_positions,
         "answer_token_ids": token_ids,

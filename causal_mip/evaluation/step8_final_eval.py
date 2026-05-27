@@ -260,12 +260,16 @@ def summarize_predictions(predictions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def load_model(model_path: str, device: str, peft_checkpoint: str | None = None):
+    checkpoint = Path(peft_checkpoint) if peft_checkpoint is not None else None
+    full_checkpoint = checkpoint is not None and (checkpoint / "config.json").exists()
+    adapter_checkpoint = checkpoint is not None and (checkpoint / "adapter_config.json").exists()
+    load_path = str(checkpoint) if full_checkpoint and not adapter_checkpoint else model_path
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_path,
+        load_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
-    if peft_checkpoint is not None:
+    if adapter_checkpoint:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, peft_checkpoint, is_trainable=False)

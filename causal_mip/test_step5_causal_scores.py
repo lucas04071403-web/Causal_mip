@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from causal_mip.causal_scores.metrics import compute_path_causal_score_record
+from causal_mip.causal_scores.metrics import build_pair_prepared_batches
 from causal_mip.causal_scores.necessity import compute_necessity
 from causal_mip.causal_scores.retain_impact import compute_retain_impact
 from causal_mip.causal_scores.sufficiency import compute_sufficiency
@@ -114,6 +115,46 @@ def _prepared_batch(
         prompt_length=2,
         target_answer_text="a",
     )
+
+
+class DummyTokenizer:
+    pad_token_id = 0
+
+
+class DummyProcessor:
+    tokenizer = DummyTokenizer()
+
+    def apply_chat_template(self, conversation, tokenize=False, add_generation_prompt=False):
+        del tokenize
+        parts = []
+        for message in conversation:
+            for item in message["content"]:
+                if item["type"] == "text":
+                    parts.append(item["text"])
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        return " ".join(parts)
+
+    def __call__(self, text, images=None, padding=True, return_tensors="pt"):
+        del images, padding, return_tensors
+        encoded = [[(ord(char) % 29) + 1 for char in text[0]]]
+        return {
+            "input_ids": torch.tensor(encoded, dtype=torch.long),
+            "attention_mask": torch.ones((1, len(encoded[0])), dtype=torch.long),
+            "pixel_values": None,
+            "image_grid_thw": None,
+        }
+
+
+def _sample(sample_id: int, question: str, answer: str) -> dict:
+    return {
+        "id": sample_id,
+        "row_idx": sample_id,
+        "question": question,
+        "answer": answer,
+        "caption": answer,
+        "image_ref": {},
+    }
 
 
 def _candidate_path() -> CandidatePath:
@@ -281,10 +322,39 @@ def test_vision_text_projector_path_causal_scores():
     assert "model.mm_projector" in restored_modules
 
 
+def test_step5_falls_back_when_corrupt_input_matches_clean():
+    model = ToyModel()
+    pair = {
+        "pair_id": "pair_same_corrupt",
+        "forget_clean": _sample(1, "Who is in this image?", "Alice is shown with books."),
+        "forget_corrupt": _sample(1, "Who is in this image?", "Alice is shown with flowers."),
+        "hard_retain": [
+            {
+                **_sample(1, "Describe the visible scene.", "A person is shown with books."),
+                "type": "same_topic",
+            }
+        ],
+        "counterfactual_retain": {
+            **_sample(2, "Who is in this image?", "Bob is shown near a car."),
+            "type": "counterfactual_retain",
+        },
+    }
+    batches = build_pair_prepared_batches(
+        pair=pair,
+        processor=DummyProcessor(),
+        model=model,
+        image_resize=32,
+    )
+    corrupt_batch = batches["forget_corrupt_target_clean_answer"]
+    assert corrupt_batch.sample["step5_corrupt_source"] == "counterfactual_retain_fallback"
+    assert corrupt_batch.sample["id"] == 2
+
+
 def main():
     test_causal_scores()
     test_vision_path_causal_scores()
     test_vision_text_projector_path_causal_scores()
+    test_step5_falls_back_when_corrupt_input_matches_clean()
     print("Step 5 causal-score tests passed.")
 
 

@@ -24,8 +24,10 @@ class PathNeuronMask:
     module_kind: str = "llm"
     forget_neurons: set[int] = field(default_factory=set)
     shared_neurons: set[int] = field(default_factory=set)
+    probe_neurons: set[int] = field(default_factory=set)
     forget_path_ids: set[str] = field(default_factory=set)
     shared_path_ids: set[str] = field(default_factory=set)
+    probe_path_ids: set[str] = field(default_factory=set)
     trace_module: str | None = None
     trace_kind: Literal["input", "output"] = "input"
     active: bool = False
@@ -35,8 +37,12 @@ class PathNeuronMask:
         return set(self.forget_neurons) - set(self.shared_neurons)
 
     @property
+    def trainable_neurons(self) -> set[int]:
+        return set(self.editable_neurons) | set(self.probe_neurons)
+
+    @property
     def preserve_neurons(self) -> set[int]:
-        return set(self.forget_neurons) | set(self.shared_neurons)
+        return set(self.forget_neurons) | set(self.shared_neurons) | set(self.probe_neurons)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -45,10 +51,13 @@ class PathNeuronMask:
             "module_kind": self.module_kind,
             "num_forget_neurons": len(self.forget_neurons),
             "num_shared_neurons": len(self.shared_neurons),
-            "num_editable_neurons": len(self.editable_neurons),
+            "num_probe_neurons": len(self.probe_neurons),
+            "num_forget_editable_neurons": len(self.editable_neurons),
+            "num_editable_neurons": len(self.trainable_neurons),
             "num_preserve_neurons": len(self.preserve_neurons),
             "forget_path_ids": sorted(self.forget_path_ids),
             "shared_path_ids": sorted(self.shared_path_ids),
+            "probe_path_ids": sorted(self.probe_path_ids),
             "trace_module": self.trace_module,
             "trace_kind": self.trace_kind,
             "active": self.active,
@@ -60,14 +69,19 @@ class MaskedRMisUConfig:
     candidate_paths_path: str
     p_forget_path: str
     p_shared_path: str | None = None
+    p_probe_path: str | None = None
     alpha: float = 1.0
     beta: float = 1.0
+    probe_beta: float = 0.05
     shared_alpha: float = 1.0
     forget_objective: str = "activation_random"
     forget_ce_alpha: float = 0.0
+    target_ce_scope: str = "all"
     projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp"
     steering_coeff: float = 6.5
     coeffs: float = 1.0
+    probe_steering_coeff: float = 1.0
+    probe_coeffs: float = 1.0
     learning_rate: float = 1e-5
     epochs: int = 1
     use_shared_preserve: bool = True
@@ -183,13 +197,15 @@ def build_path_neuron_masks(
     candidate_paths_path: str,
     p_forget_path: str,
     p_shared_path: str | None = None,
+    p_probe_path: str | None = None,
     strict: bool = False,
 ) -> dict[str, PathNeuronMask]:
     candidates = load_candidate_paths_by_id(candidate_paths_path)
     forget_ids = load_step6_path_ids(p_forget_path)
     shared_ids = load_step6_path_ids(p_shared_path)
+    probe_ids = load_step6_path_ids(p_probe_path)
     masks: dict[str, PathNeuronMask] = {}
-    missing_ids = sorted((forget_ids | shared_ids) - set(candidates))
+    missing_ids = sorted((forget_ids | shared_ids | probe_ids) - set(candidates))
     if missing_ids and strict:
         raise KeyError(f"Step 6 path ids not found in candidate paths: {missing_ids[:10]}")
 
@@ -221,6 +237,18 @@ def build_path_neuron_masks(
             mask = ensure_mask(node.module, node.layer, module_kind)
             mask.shared_neurons.add(int(node.neuron))
             mask.shared_path_ids.add(path_id)
+
+    for path_id in sorted(probe_ids):
+        candidate = candidates.get(path_id)
+        if candidate is None:
+            continue
+        for node in candidate.nodes:
+            module_kind = _patchable_down_proj_kind(node.module)
+            if module_kind is None:
+                continue
+            mask = ensure_mask(node.module, node.layer, module_kind)
+            mask.probe_neurons.add(int(node.neuron))
+            mask.probe_path_ids.add(path_id)
 
     return masks
 
@@ -263,13 +291,14 @@ def apply_masked_rmisu_parameter_mask(
     summary = {
         "num_modules": 0,
         "num_editable_neurons": 0,
+        "num_probe_neurons": 0,
         "modules": [],
         "skipped_modules": [],
     }
 
     for down_proj_name, mask in sorted(masks.items()):
-        editable = sorted(mask.editable_neurons)
-        if not editable:
+        trainable = sorted(mask.trainable_neurons)
+        if not trainable:
             summary["skipped_modules"].append(
                 {"module": down_proj_name, "reason": "no_editable_neurons"}
             )
@@ -294,7 +323,7 @@ def apply_masked_rmisu_parameter_mask(
                 continue
             try:
                 linear = get_module(model, edit_module_name)
-                wrapped = _wrap_linear_with_partial(linear, editable)
+                wrapped = _wrap_linear_with_partial(linear, trainable)
                 _replace_child_module(model, edit_module_name, wrapped)
             except (KeyError, TypeError, IndexError):
                 if strict:
@@ -307,11 +336,14 @@ def apply_masked_rmisu_parameter_mask(
             mask.trace_kind = "output"
             mask.active = True
             summary["num_modules"] += 1
-            summary["num_editable_neurons"] += len(editable)
+            summary["num_editable_neurons"] += len(trainable)
+            summary["num_probe_neurons"] += len(mask.probe_neurons)
             summary["modules"].append(
                 {
                     **mask.to_summary(),
-                    "editable_neurons": editable,
+                    "editable_neurons": trainable,
+                    "forget_editable_neurons": sorted(mask.editable_neurons),
+                    "probe_neurons": sorted(mask.probe_neurons),
                     "edit_module": edit_module_name,
                 }
             )
@@ -332,16 +364,19 @@ def apply_masked_rmisu_parameter_mask(
                 if strict:
                     raise KeyError(f"{mlp_name}.{proj_name} not found")
                 continue
-            wrapped = _wrap_linear_with_partial(getattr(mlp, proj_name), editable)
+            wrapped = _wrap_linear_with_partial(getattr(mlp, proj_name), trainable)
             _replace_child_module(model, f"{mlp_name}.{proj_name}", wrapped)
 
         summary["num_modules"] += 1
-        summary["num_editable_neurons"] += len(editable)
+        summary["num_editable_neurons"] += len(trainable)
+        summary["num_probe_neurons"] += len(mask.probe_neurons)
         mask.active = True
         summary["modules"].append(
             {
                 **mask.to_summary(),
-                "editable_neurons": editable,
+                "editable_neurons": trainable,
+                "forget_editable_neurons": sorted(mask.editable_neurons),
+                "probe_neurons": sorted(mask.probe_neurons),
                 "edit_module": down_proj_name,
             }
         )
@@ -383,6 +418,10 @@ class DownProjInputTracer:
     def _neurons_for_mask(self, mask: PathNeuronMask) -> list[int]:
         if self.neuron_kind == "editable":
             return sorted(mask.editable_neurons)
+        if self.neuron_kind == "probe":
+            return sorted(mask.probe_neurons)
+        if self.neuron_kind == "trainable":
+            return sorted(mask.trainable_neurons)
         if self.neuron_kind == "shared":
             return sorted(mask.shared_neurons)
         if self.neuron_kind == "preserve":
@@ -432,7 +471,7 @@ def _model_device(model: nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
-def _forward_batch(model: nn.Module, batch):
+def _forward_batch(model: nn.Module, batch, compute_loss: bool = False):
     device = _model_device(model)
     arch = getattr(model.config, "architectures", [""])[0]
     if "Qwen" in arch:
@@ -440,7 +479,7 @@ def _forward_batch(model: nn.Module, batch):
         attention_mask = batch[1].to(device)
         pixel_values = batch[2].to(device) if batch[2] is not None else None
         image_grid_thw = batch[3].to(device) if batch[3] is not None else None
-        labels = batch[4].to(device)
+        labels = batch[4].to(device) if compute_loss else None
         return model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -452,17 +491,91 @@ def _forward_batch(model: nn.Module, batch):
         input_ids = batch[0].to(device)
         attention_mask = batch[1].to(device)
         pixel_values = batch[2].to(device)
-        labels = batch[3].to(device)
+        labels = batch[3].to(device) if compute_loss else None
         return model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixel_values, labels=labels)
     if "Gemma" in arch:
         inputs = batch[0]
+        labels = inputs["labels"].to(device) if compute_loss else None
         return model(
             input_ids=inputs["input_ids"].to(device),
             attention_mask=inputs["attention_mask"].to(device),
             pixel_values=inputs["pixel_values"].to(device),
-            labels=inputs["labels"].to(device),
+            labels=labels,
         )
     return model(*batch)
+
+
+def _batch_labels(batch) -> torch.Tensor | None:
+    arch_batch_len = len(batch) if isinstance(batch, tuple) else 0
+    if arch_batch_len >= 5 and torch.is_tensor(batch[4]):
+        return batch[4]
+    if arch_batch_len >= 4 and torch.is_tensor(batch[3]):
+        return batch[3]
+    if arch_batch_len >= 1 and isinstance(batch[0], dict):
+        labels = batch[0].get("labels")
+        if torch.is_tensor(labels):
+            return labels
+    return None
+
+
+def _batch_item_list(batch) -> list[Any]:
+    if isinstance(batch, tuple) and batch:
+        maybe_items = batch[-1]
+        if isinstance(maybe_items, list):
+            return maybe_items
+    return []
+
+
+def _metadata_positions(item: Any, scope: str) -> list[int]:
+    if not isinstance(item, dict):
+        return []
+    if scope == "answer":
+        positions = item.get("answer_token_positions")
+    elif scope == "name":
+        positions = item.get("name_token_positions")
+    else:
+        positions = None
+    if positions is None:
+        return []
+    return [int(position) for position in positions]
+
+
+def _labels_for_target_ce(batch, scope: str, device: torch.device) -> tuple[torch.Tensor | None, int]:
+    labels = _batch_labels(batch)
+    if labels is None:
+        return None, 0
+    labels = labels.to(device)
+    if scope == "all":
+        token_count = int((labels != -100).detach().sum().cpu().item())
+        return labels, token_count
+
+    item_list = _batch_item_list(batch)
+    masked_labels = torch.full_like(labels, -100)
+    for row_idx, item in enumerate(item_list[: labels.shape[0]]):
+        positions = _metadata_positions(item, scope)
+        if scope == "name" and not positions:
+            positions = _metadata_positions(item, "answer")
+        for position in positions:
+            if 0 <= position < labels.shape[1] and labels[row_idx, position] != -100:
+                masked_labels[row_idx, position] = labels[row_idx, position]
+
+    token_count = int((masked_labels != -100).detach().sum().cpu().item())
+    if token_count == 0:
+        if scope == "name":
+            return _labels_for_target_ce(batch, "answer", device)
+        token_count = int((labels != -100).detach().sum().cpu().item())
+        return labels, token_count
+    return masked_labels, token_count
+
+
+def _targeted_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    return loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1).to(shift_logits.device),
+    )
 
 
 def _activation_mse_to_random(
@@ -497,16 +610,49 @@ def _activation_preserve_loss(
 
 
 def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
-    allowed = {"activation_random", "ce_ascent", "activation_random_ce"}
+    allowed = {
+        "activation_random",
+        "ce_ascent",
+        "answer_ce_ascent",
+        "name_ce_ascent",
+        "activation_random_ce",
+        "activation_random_answer_ce",
+        "activation_random_name_ce",
+    }
     if config.forget_objective not in allowed:
         raise ValueError(
             f"Unsupported forget_objective={config.forget_objective}. "
             f"Expected one of {sorted(allowed)}."
         )
-    if config.forget_objective in {"ce_ascent", "activation_random_ce"} and config.forget_ce_alpha <= 0.0:
+    if config.forget_objective in {
+        "ce_ascent",
+        "answer_ce_ascent",
+        "name_ce_ascent",
+        "activation_random_ce",
+        "activation_random_answer_ce",
+        "activation_random_name_ce",
+    } and config.forget_ce_alpha <= 0.0:
         raise ValueError(
             f"forget_objective={config.forget_objective} requires forget_ce_alpha > 0"
         )
+    allowed_scopes = {"all", "answer", "name"}
+    if config.target_ce_scope not in allowed_scopes:
+        raise ValueError(
+            f"Unsupported target_ce_scope={config.target_ce_scope}. "
+            f"Expected one of {sorted(allowed_scopes)}."
+        )
+
+
+def _ce_scope_for_objective(config: MaskedRMisUConfig) -> str:
+    objective_to_scope = {
+        "ce_ascent": "all",
+        "activation_random_ce": "all",
+        "answer_ce_ascent": "answer",
+        "activation_random_answer_ce": "answer",
+        "name_ce_ascent": "name",
+        "activation_random_name_ce": "name",
+    }
+    return objective_to_scope.get(config.forget_objective, config.target_ce_scope)
 
 
 def masked_rmisu_finetune(
@@ -521,6 +667,7 @@ def masked_rmisu_finetune(
         candidate_paths_path=config.candidate_paths_path,
         p_forget_path=config.p_forget_path,
         p_shared_path=config.p_shared_path,
+        p_probe_path=config.p_probe_path,
     )
     mask_summary = apply_masked_rmisu_parameter_mask(
         updated_model,
@@ -554,22 +701,58 @@ def masked_rmisu_finetune(
                 break
             optimizer.zero_grad()
 
-            with DownProjInputTracer(updated_model, masks, neuron_kind="editable", detach=False) as forget_trace:
+            with DownProjInputTracer(
+                updated_model, masks, neuron_kind="editable", detach=False
+            ) as forget_trace, DownProjInputTracer(
+                updated_model, masks, neuron_kind="probe", detach=False
+            ) as probe_trace:
                 forget_output = _forward_batch(updated_model, forget_batch)
-            if config.forget_objective in {"activation_random", "activation_random_ce"}:
-                unlearn_loss = _activation_mse_to_random(
-                    forget_trace.activations,
-                    steering_coeff=config.steering_coeff,
-                    coeffs=config.coeffs,
-                )
+            device = _model_device(updated_model)
+            if config.forget_objective in {
+                "activation_random",
+                "activation_random_ce",
+                "activation_random_answer_ce",
+                "activation_random_name_ce",
+            }:
+                if forget_trace.activations:
+                    unlearn_loss = _activation_mse_to_random(
+                        forget_trace.activations,
+                        steering_coeff=config.steering_coeff,
+                        coeffs=config.coeffs,
+                    )
+                elif config.p_probe_path is None:
+                    raise ValueError("No editable activations were captured for masked RMisU unlearn loss")
+                else:
+                    unlearn_loss = torch.tensor(0.0, device=device)
             else:
-                unlearn_loss = torch.tensor(0.0, device=_model_device(updated_model))
-            forget_ce_loss = torch.tensor(0.0, device=_model_device(updated_model))
-            if config.forget_ce_alpha != 0.0 or config.forget_objective == "ce_ascent":
-                forget_ce_loss = forget_output.loss.to(_model_device(updated_model))
+                unlearn_loss = torch.tensor(0.0, device=device)
+            probe_loss = torch.tensor(0.0, device=device)
+            if config.p_probe_path is not None and config.probe_beta != 0.0:
+                if not probe_trace.activations:
+                    raise ValueError("No probe activations were captured for masked RMisU probe loss")
+                probe_loss = _activation_mse_to_random(
+                    probe_trace.activations,
+                    steering_coeff=config.probe_steering_coeff,
+                    coeffs=config.probe_coeffs,
+                )
+            forget_ce_loss = torch.tensor(0.0, device=device)
+            forget_ce_token_count = 0
+            if config.forget_ce_alpha != 0.0 or config.forget_objective in {
+                "ce_ascent",
+                "answer_ce_ascent",
+                "name_ce_ascent",
+            }:
+                target_ce_scope = _ce_scope_for_objective(config)
+                target_labels, forget_ce_token_count = _labels_for_target_ce(
+                    forget_batch,
+                    target_ce_scope,
+                    device,
+                )
+                if target_labels is not None:
+                    forget_ce_loss = _targeted_ce_loss(forget_output.logits, target_labels)
 
-            retain_loss = torch.tensor(0.0, device=_model_device(updated_model))
-            shared_loss = torch.tensor(0.0, device=_model_device(updated_model))
+            retain_loss = torch.tensor(0.0, device=device)
+            shared_loss = torch.tensor(0.0, device=device)
             if frozen_model is not None and (config.use_retain_preserve or config.use_shared_preserve):
                 with torch.no_grad(), DownProjInputTracer(
                     frozen_model, masks, neuron_kind="preserve", detach=True
@@ -581,7 +764,7 @@ def masked_rmisu_finetune(
                 ) as retain_trace:
                     _forward_batch(updated_model, retain_batch)
                 retain_loss = _activation_preserve_loss(retain_trace.activations, frozen_trace.activations).to(
-                    _model_device(updated_model)
+                    device
                 )
 
                 if config.use_shared_preserve:
@@ -595,10 +778,11 @@ def masked_rmisu_finetune(
                         _forward_batch(updated_model, retain_batch)
                     shared_loss = _activation_preserve_loss(
                         shared_trace.activations, frozen_shared_trace.activations
-                    ).to(_model_device(updated_model))
+                    ).to(device)
 
             loss = (
                 config.beta * unlearn_loss
+                + config.probe_beta * probe_loss
                 + config.alpha * retain_loss
                 + config.shared_alpha * shared_loss
                 - config.forget_ce_alpha * forget_ce_loss
@@ -612,8 +796,11 @@ def masked_rmisu_finetune(
                 "step": step,
                 "loss": float(loss.detach().cpu().item()),
                 "unlearn_loss": float(unlearn_loss.detach().cpu().item()),
+                "probe_loss": float(probe_loss.detach().cpu().item()),
                 "forget_ce_loss": float(forget_ce_loss.detach().cpu().item()),
                 "forget_objective": config.forget_objective,
+                "forget_ce_scope": _ce_scope_for_objective(config),
+                "forget_ce_token_count": forget_ce_token_count,
                 "retain_loss": float(retain_loss.detach().cpu().item()),
                 "shared_loss": float(shared_loss.detach().cpu().item()),
             }
@@ -622,6 +809,7 @@ def masked_rmisu_finetune(
                 iterator.set_postfix(
                     loss=record["loss"],
                     unlearn=record["unlearn_loss"],
+                    probe=record["probe_loss"],
                     forget_ce=record["forget_ce_loss"],
                     retain=record["retain_loss"],
                     shared=record["shared_loss"],
@@ -632,6 +820,17 @@ def masked_rmisu_finetune(
 
     summary = {
         "mask_summary": mask_summary,
+        "probe_config": {
+            "p_probe_path": config.p_probe_path,
+            "probe_beta": config.probe_beta,
+            "probe_steering_coeff": config.probe_steering_coeff,
+            "probe_coeffs": config.probe_coeffs,
+        },
+        "forget_config": {
+            "forget_objective": config.forget_objective,
+            "forget_ce_alpha": config.forget_ce_alpha,
+            "target_ce_scope": _ce_scope_for_objective(config),
+        },
         "num_loss_records": len(losses),
         "losses": losses,
     }

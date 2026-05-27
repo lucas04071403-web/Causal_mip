@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from causal_mip.causal_scores.necessity import compute_necessity
 from causal_mip.causal_scores.retain_impact import compute_retain_impact
 from causal_mip.causal_scores.sufficiency import compute_sufficiency
@@ -42,22 +44,45 @@ def build_pair_prepared_batches(
     counterfactual = extract_pair_sample(pair, "counterfactual_retain")
     same_topic = extract_pair_sample(pair, "hard_retain", hard_retain_type="same_topic")
 
-    batches = {
-        "forget_clean": prepare_sample_batch(
-            forget_clean,
-            processor=processor,
-            model=model,
-            image_resize=image_resize,
-            resolver=resolver,
-        ),
-        "forget_corrupt_target_clean_answer": prepare_sample_batch(
-            forget_corrupt,
+    forget_clean_batch = prepare_sample_batch(
+        forget_clean,
+        processor=processor,
+        model=model,
+        image_resize=image_resize,
+        resolver=resolver,
+    )
+    corrupt_batch = prepare_sample_batch(
+        forget_corrupt,
+        processor=processor,
+        model=model,
+        image_resize=image_resize,
+        resolver=resolver,
+        target_answer_text=forget_clean.get("answer"),
+    )
+    corrupt_source = "forget_corrupt"
+    if _same_model_inputs_for_sufficiency(
+        forget_clean_batch,
+        corrupt_batch,
+    ):
+        corrupt_batch = prepare_sample_batch(
+            counterfactual,
             processor=processor,
             model=model,
             image_resize=image_resize,
             resolver=resolver,
             target_answer_text=forget_clean.get("answer"),
-        ),
+        )
+        corrupt_source = "counterfactual_retain_fallback"
+
+    forget_clean_batch.sample = dict(forget_clean_batch.sample)
+    forget_clean_batch.sample["step5_role"] = "forget_clean"
+    corrupt_batch.sample = dict(corrupt_batch.sample)
+    corrupt_batch.sample["step5_role"] = "forget_corrupt_target_clean_answer"
+    corrupt_batch.sample["step5_corrupt_source"] = corrupt_source
+
+    batches = {
+        "forget_clean": forget_clean_batch,
+        "forget_corrupt_target_clean_answer": corrupt_batch,
         "same_topic": prepare_sample_batch(
             same_topic,
             processor=processor,
@@ -88,6 +113,29 @@ def build_pair_prepared_batches(
     return batches
 
 
+def _tensor_equal(left: torch.Tensor | None, right: torch.Tensor | None) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    if left.shape != right.shape:
+        return False
+    return bool(torch.equal(left.detach().cpu(), right.detach().cpu()))
+
+
+def _same_model_inputs_for_sufficiency(clean_batch: PreparedSampleBatch, corrupt_batch: PreparedSampleBatch) -> bool:
+    keys = sorted(set(clean_batch.model_inputs) | set(corrupt_batch.model_inputs))
+    for key in keys:
+        if key == "labels":
+            continue
+        left = clean_batch.model_inputs.get(key)
+        right = corrupt_batch.model_inputs.get(key)
+        if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+            if not _tensor_equal(left, right):
+                return False
+        elif left != right:
+            return False
+    return True
+
+
 def compute_path_causal_score_record(
     model,
     candidate_path: CandidatePath,
@@ -106,6 +154,10 @@ def compute_path_causal_score_record(
         "mip_score": candidate_path.mip_score,
         "num_nodes": len(candidate_path.nodes),
         "num_patchable_nodes": len(resolved_nodes),
+        "sufficiency_corrupt_source": prepared_batches["forget_corrupt_target_clean_answer"].sample.get(
+            "step5_corrupt_source",
+            "forget_corrupt",
+        ),
     }
 
     if not resolved_nodes:
