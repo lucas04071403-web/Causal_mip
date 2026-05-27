@@ -15,6 +15,7 @@ from causal_mip.path_localization import (
     CandidatePath,
     build_simple_cross_modal_paths,
     build_cross_modal_paths_from_unimodal_paths,
+    export_saliency_specific_candidates,
     merge_paths_from_modalities,
     load_candidate_paths,
     extract_text_paths_from_mip_scores,
@@ -215,6 +216,99 @@ def test_merge_and_save():
     return True
 
 
+def test_saliency_specific_candidate_export():
+    """Test saliency-specific candidate export from Step5 score records."""
+    print("\n=== Testing Saliency-Specific Candidate Export ===")
+
+    import json
+    import tempfile
+    from pathlib import Path
+    from causal_mip.path_localization.path_schema import PathNode, CandidatePath
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        scores_path = temp / "scores.jsonl"
+        output_candidates = temp / "P_cand_saliency.jsonl"
+        output_bindings = temp / "P_cand_saliency_bound.jsonl"
+        summary_path = temp / "summary.json"
+
+        candidates = [
+            CandidatePath(
+                path_id="text_igi_p000000",
+                source="mip_editor_igi",
+                modality="text",
+                mip_score=0.1,
+                nodes=[PathNode("model.language_model.layers.0.mlp.down_proj", 0, 1, "answer_tokens")],
+            ),
+            CandidatePath(
+                path_id="vision_fisher_p000000",
+                source="mip_editor_ifi",
+                modality="vision",
+                mip_score=0.2,
+                nodes=[PathNode("model.visual.blocks.0.mlp.down_proj", 0, 2, "image_tokens")],
+            ),
+        ]
+        with candidates_path.open("w", encoding="utf-8") as handle:
+            for path in candidates:
+                handle.write(json.dumps(path.to_dict()) + "\n")
+
+        records = [
+            {
+                "pair_id": "pair_000000",
+                "path_id": "text_igi_p000000",
+                "path_modality": "text",
+                "path_source": "mip_editor_igi",
+                "status": "ok",
+                "all_nodes_patchable": True,
+                "contains_projector": False,
+                "projector_patchable": False,
+                "forget_saliency": 0.4,
+                "retain_anchor_saliency": 0.1,
+                "saliency_specificity_margin": 0.3,
+                "saliency_specificity_ratio": 4.0,
+            },
+            {
+                "pair_id": "pair_000000",
+                "path_id": "vision_fisher_p000000",
+                "path_modality": "vision",
+                "path_source": "mip_editor_ifi",
+                "status": "ok",
+                "all_nodes_patchable": True,
+                "contains_projector": False,
+                "projector_patchable": False,
+                "forget_saliency": 0.1,
+                "retain_anchor_saliency": 0.2,
+                "saliency_specificity_margin": -0.1,
+                "saliency_specificity_ratio": 0.5,
+            },
+        ]
+        with scores_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+        summary = export_saliency_specific_candidates(
+            score_paths=[str(scores_path)],
+            candidate_paths_path=str(candidates_path),
+            output_candidates_path=str(output_candidates),
+            output_bindings_path=str(output_bindings),
+            summary_path=str(summary_path),
+            top_k_per_pair_modality=2,
+        )
+
+        selected = load_candidate_paths(str(output_candidates))
+        assert summary["num_selected_candidate_paths"] == 1
+        assert summary["num_selected_bindings"] == 1
+        assert selected[0].path_id == "saliency_specific_p000000"
+        assert selected[0].source == "mip_editor_igi_saliency_specific"
+        assert selected[0].metadata["original_path_id"] == "text_igi_p000000"
+        bindings = [json.loads(line) for line in output_bindings.read_text(encoding="utf-8").splitlines()]
+        assert bindings[0]["path_id"] == "saliency_specific_p000000"
+
+    print("✓ Saliency-specific candidate export test passed!")
+    return True
+
+
 def test_full_pipeline():
     """Test the full pipeline with a mock model."""
     print("\n=== Testing Full Pipeline (Mock) ===")
@@ -284,6 +378,7 @@ def main():
         ("Cross-Modal Builder", test_cross_modal_builder),
         ("Cross-Modal From Unimodal", test_cross_modal_from_unimodal_paths),
         ("Merge and Save", test_merge_and_save),
+        ("Saliency-Specific Candidate Export", test_saliency_specific_candidate_export),
         ("Full Pipeline", test_full_pipeline),
     ]
 

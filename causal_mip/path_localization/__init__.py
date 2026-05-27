@@ -35,6 +35,7 @@ from .cross_modal_path_builder import (
 )
 
 from .cached_path_export import export_candidate_paths_from_cached_scores
+from .saliency_specific_export import export_saliency_specific_candidates
 
 __all__ = [
     # Schema
@@ -59,4 +60,5 @@ __all__ = [
     "merge_paths_from_modalities",
     "load_candidate_paths",
     "export_candidate_paths_from_cached_scores",
+    "export_saliency_specific_candidates",
 ]

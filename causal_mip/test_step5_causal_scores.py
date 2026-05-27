@@ -12,6 +12,7 @@ from causal_mip.causal_scores.metrics import compute_path_causal_score_record
 from causal_mip.causal_scores.metrics import build_pair_prepared_batches
 from causal_mip.causal_scores.necessity import compute_necessity
 from causal_mip.causal_scores.retain_impact import compute_retain_impact
+from causal_mip.causal_scores.saliency_specificity import compute_path_saliency_specificity
 from causal_mip.causal_scores.sufficiency import compute_sufficiency
 from causal_mip.interventions.activation_cache import PreparedSampleBatch
 from causal_mip.path_localization.path_schema import CandidatePath, PathNode
@@ -224,6 +225,56 @@ def test_causal_scores():
     assert "corrupt_target" in record["sufficiency"]
     assert "restored_nodes" in record["sufficiency"]
     assert record["sufficiency"]["clean_target"]["answer_token_positions"] == [2, 3]
+    assert record["num_skipped_nodes"] == 0
+    assert record["all_nodes_patchable"] is True
+    assert len(record["resolved_nodes"]) == 2
+    assert record["resolved_nodes"][0]["module_kind"] == "llm"
+    assert record["skipped_nodes"] == []
+    assert "sufficiency_clean_score" in record
+    assert "sufficiency_corrupt_score" in record
+    assert "sufficiency_restored_score" in record
+    assert record["target_answer_text"] == "a"
+
+    saliency_record = compute_path_causal_score_record(
+        model=model,
+        candidate_path=candidate_path,
+        pair={"pair_id": "pair_000000"},
+        prepared_batches={
+            "forget_clean": clean_batch,
+            "forget_corrupt_target_clean_answer": corrupt_batch,
+            **_retain_batches(),
+        },
+        strict=True,
+        compute_saliency=True,
+    )
+    assert saliency_record["saliency_status"] == "ok"
+    assert saliency_record["forget_saliency"] is not None
+    assert saliency_record["retain_anchor_saliency"] is not None
+    assert saliency_record["saliency_specificity_margin"] is not None
+    assert saliency_record["fisher_specificity_margin"] is not None
+    assert "saliency_specificity" in saliency_record
+
+
+def test_path_saliency_specificity():
+    torch.manual_seed(11)
+    model = ToyModel()
+    clean_batch = _prepared_batch(torch.tensor([[1, 2, 3, 4]]))
+    candidate_path = _candidate_path()
+
+    saliency = compute_path_saliency_specificity(
+        model=model,
+        forget_batch=clean_batch,
+        retain_batches=_retain_batches(),
+        candidate_path=candidate_path,
+        strict=True,
+    )
+
+    assert saliency["status"] == "ok"
+    assert saliency["forget_saliency"] >= 0.0
+    assert saliency["retain_anchor_saliency"] >= 0.0
+    assert saliency["saliency_specificity_ratio"] >= 0.0
+    assert saliency["forget"]["num_scored_nodes"] == 2
+    assert set(saliency["retain_anchors"].keys()) == {"same_topic", "same_reasoning", "counterfactual_retain"}
 
 
 def test_vision_path_causal_scores():
@@ -254,6 +305,8 @@ def test_vision_path_causal_scores():
     assert record["Nec"] is not None
     assert record["Suf"] is not None
     assert record["Ret"] is not None
+    assert record["contains_projector"] is False
+    assert record["projector_patchable"] is False
 
 
 def test_vision_text_projector_path_causal_scores():
@@ -315,6 +368,11 @@ def test_vision_text_projector_path_causal_scores():
     assert record["Nec"] is not None
     assert record["Suf"] is not None
     assert record["Ret"] is not None
+    assert record["contains_projector"] is True
+    assert record["projector_patchable"] is True
+    assert record["num_projector_nodes"] == 1
+    assert record["num_patchable_projector_nodes"] == 1
+    assert record["all_nodes_patchable"] is True
     restored_modules = {
         node["module"]
         for node in record["sufficiency"]["restored_nodes"]
@@ -352,6 +410,7 @@ def test_step5_falls_back_when_corrupt_input_matches_clean():
 
 def main():
     test_causal_scores()
+    test_path_saliency_specificity()
     test_vision_path_causal_scores()
     test_vision_text_projector_path_causal_scores()
     test_step5_falls_back_when_corrupt_input_matches_clean()

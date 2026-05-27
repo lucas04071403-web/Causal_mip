@@ -23,6 +23,15 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
@@ -63,6 +72,18 @@ def _positive_or_signed(value: float, clip_negative_effects: bool) -> float:
     return max(0.0, value) if clip_negative_effects else value
 
 
+def _aggregate_optional_float(
+    records: list[dict[str, Any]],
+    key: str,
+    aggregation: str,
+) -> float | None:
+    values = [_as_float(record.get(key)) for record in records]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return _aggregate(values, aggregation)
+
+
 def aggregate_path_score_records(
     records: list[dict[str, Any]],
     alpha: float = 1.0,
@@ -101,6 +122,12 @@ def aggregate_path_score_records(
         forget_effect = _positive_or_signed(nec, clip_negative_effects) + alpha * _positive_or_signed(suf, clip_negative_effects)
         retain_impact = _positive_or_signed(ret, clip_negative_effects)
         first = path_records[0]
+        full_patchable_records = []
+        for record in path_records:
+            num_nodes = _as_int(record.get("num_nodes"), -1)
+            num_patchable_nodes = _as_int(record.get("num_patchable_nodes"), 0)
+            if num_nodes >= 0 and num_patchable_nodes == num_nodes:
+                full_patchable_records.append(record)
 
         aggregated.append(
             {
@@ -110,6 +137,13 @@ def aggregate_path_score_records(
                 "mip_score": first.get("mip_score"),
                 "num_nodes": first.get("num_nodes"),
                 "num_patchable_nodes": first.get("num_patchable_nodes"),
+                "min_num_patchable_nodes": min(_as_int(record.get("num_patchable_nodes"), 0) for record in path_records),
+                "max_num_patchable_nodes": max(_as_int(record.get("num_patchable_nodes"), 0) for record in path_records),
+                "num_fully_patchable_score_records": len(full_patchable_records),
+                "all_score_records_fully_patchable": len(full_patchable_records) == len(path_records),
+                "num_positive_suf_records": sum(1 for value in suf_values if value > 0.0),
+                "contains_projector": any(bool(record.get("contains_projector", False)) for record in path_records),
+                "projector_patchable": any(bool(record.get("projector_patchable", False)) for record in path_records),
                 "num_score_records": len(path_records),
                 "pair_ids": sorted({record.get("pair_id") for record in path_records if record.get("pair_id") is not None}),
                 "Nec": nec,
@@ -117,6 +151,34 @@ def aggregate_path_score_records(
                 "Ret": ret,
                 "forget_effect": forget_effect,
                 "retain_impact": retain_impact,
+                "forget_saliency": _aggregate_optional_float(path_records, "forget_saliency", aggregation),
+                "retain_anchor_saliency": _aggregate_optional_float(path_records, "retain_anchor_saliency", aggregation),
+                "saliency_specificity_margin": _aggregate_optional_float(
+                    path_records,
+                    "saliency_specificity_margin",
+                    aggregation,
+                ),
+                "saliency_specificity_ratio": _aggregate_optional_float(
+                    path_records,
+                    "saliency_specificity_ratio",
+                    aggregation,
+                ),
+                "forget_fisher_saliency": _aggregate_optional_float(path_records, "forget_fisher_saliency", aggregation),
+                "retain_anchor_fisher_saliency": _aggregate_optional_float(
+                    path_records,
+                    "retain_anchor_fisher_saliency",
+                    aggregation,
+                ),
+                "fisher_specificity_margin": _aggregate_optional_float(
+                    path_records,
+                    "fisher_specificity_margin",
+                    aggregation,
+                ),
+                "fisher_specificity_ratio": _aggregate_optional_float(
+                    path_records,
+                    "fisher_specificity_ratio",
+                    aggregation,
+                ),
                 "aggregation": aggregation,
                 "alpha": alpha,
                 "clip_negative_effects": clip_negative_effects,
@@ -171,6 +233,52 @@ def classify_aggregated_path(path: dict[str, Any], thresholds: dict[str, float])
     return CATEGORY_IRRELEVANT
 
 
+def evaluate_forget_eligibility(
+    path: dict[str, Any],
+    min_forget_sufficiency: float = 0.0,
+    require_positive_forget_sufficiency: bool = True,
+    require_full_patchable_forget: bool = True,
+    require_saliency_specificity: bool = False,
+    saliency_specificity_key: str = "saliency_specificity_margin",
+    min_saliency_specificity: float = 0.0,
+    max_retain_anchor_saliency: float | None = None,
+) -> dict[str, Any]:
+    reasons = []
+    sufficiency = float(path.get("Suf", 0.0))
+    if require_positive_forget_sufficiency and sufficiency <= min_forget_sufficiency:
+        reasons.append("sufficiency_not_positive")
+
+    if require_full_patchable_forget:
+        if not bool(path.get("all_score_records_fully_patchable", False)):
+            reasons.append("not_all_score_records_fully_patchable")
+
+    specificity_value = _as_float(path.get(saliency_specificity_key))
+    if require_saliency_specificity:
+        if specificity_value is None:
+            reasons.append("missing_saliency_specificity")
+        elif specificity_value <= min_saliency_specificity:
+            reasons.append("saliency_specificity_too_low")
+
+    retain_anchor_saliency = _as_float(path.get("retain_anchor_saliency"))
+    if max_retain_anchor_saliency is not None:
+        if retain_anchor_saliency is None:
+            reasons.append("missing_retain_anchor_saliency")
+        elif retain_anchor_saliency > max_retain_anchor_saliency:
+            reasons.append("retain_anchor_saliency_too_high")
+
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "min_forget_sufficiency": min_forget_sufficiency,
+        "require_positive_forget_sufficiency": require_positive_forget_sufficiency,
+        "require_full_patchable_forget": require_full_patchable_forget,
+        "require_saliency_specificity": require_saliency_specificity,
+        "saliency_specificity_key": saliency_specificity_key,
+        "min_saliency_specificity": min_saliency_specificity,
+        "max_retain_anchor_saliency": max_retain_anchor_saliency,
+    }
+
+
 def classify_path_scores(
     records: list[dict[str, Any]],
     alpha: float = 1.0,
@@ -183,6 +291,14 @@ def classify_path_scores(
     min_forget_effect: float = 0.0,
     min_retain_impact: float = 0.0,
     include_non_ok: bool = False,
+    min_forget_sufficiency: float = 0.0,
+    require_positive_forget_sufficiency: bool = True,
+    require_full_patchable_forget: bool = True,
+    require_saliency_specificity: bool = False,
+    saliency_specificity_key: str = "saliency_specificity_margin",
+    min_saliency_specificity: float = 0.0,
+    max_retain_anchor_saliency: float | None = None,
+    shared_on_retain_anchor_saliency: bool = True,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     aggregated_paths = aggregate_path_score_records(
         records=records,
@@ -209,13 +325,60 @@ def classify_path_scores(
     for path in aggregated_paths:
         category = classify_aggregated_path(path, thresholds)
         path_record = dict(path)
+        path_record["pre_eligibility_category"] = category
+        if category == CATEGORY_FORGET:
+            eligibility = evaluate_forget_eligibility(
+                path_record,
+                min_forget_sufficiency=min_forget_sufficiency,
+                require_positive_forget_sufficiency=require_positive_forget_sufficiency,
+                require_full_patchable_forget=require_full_patchable_forget,
+                require_saliency_specificity=require_saliency_specificity,
+                saliency_specificity_key=saliency_specificity_key,
+                min_saliency_specificity=min_saliency_specificity,
+                max_retain_anchor_saliency=max_retain_anchor_saliency,
+            )
+            path_record["forget_eligibility"] = eligibility
+            if not eligibility["eligible"]:
+                if shared_on_retain_anchor_saliency and "retain_anchor_saliency_too_high" in eligibility["reasons"]:
+                    category = CATEGORY_SHARED
+                    path_record["demoted_from"] = CATEGORY_FORGET
+                    path_record["promoted_shared_by"] = "retain_anchor_saliency"
+                else:
+                    category = CATEGORY_IRRELEVANT
+                    path_record["demoted_from"] = CATEGORY_FORGET
         path_record["category"] = category
         path_record["thresholds"] = thresholds
         path_record.pop("_skipped_score_records", None)
         categories[category].append(path_record)
 
     skipped = aggregated_paths[0].get("_skipped_score_records", 0) if aggregated_paths else 0
-    summary = build_classification_summary(categories, thresholds, len(records), skipped)
+    summary = build_classification_summary(
+        categories,
+        thresholds,
+        len(records),
+        skipped,
+        eligibility={
+            "min_forget_sufficiency": min_forget_sufficiency,
+            "require_positive_forget_sufficiency": require_positive_forget_sufficiency,
+            "require_full_patchable_forget": require_full_patchable_forget,
+            "require_saliency_specificity": require_saliency_specificity,
+            "saliency_specificity_key": saliency_specificity_key,
+            "min_saliency_specificity": min_saliency_specificity,
+            "max_retain_anchor_saliency": max_retain_anchor_saliency,
+            "shared_on_retain_anchor_saliency": shared_on_retain_anchor_saliency,
+            "num_demoted_from_forget": sum(
+                1
+                for paths in categories.values()
+                for path in paths
+                if path.get("demoted_from") == CATEGORY_FORGET
+            ),
+            "num_forget_to_shared_by_retain_anchor": sum(
+                1
+                for path in categories[CATEGORY_SHARED]
+                if path.get("promoted_shared_by") == "retain_anchor_saliency"
+            ),
+        },
+    )
     return categories, summary
 
 
@@ -224,6 +387,7 @@ def build_classification_summary(
     thresholds: dict[str, float],
     num_input_records: int,
     num_skipped_records: int,
+    eligibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     all_paths = [path for paths in categories.values() for path in paths]
     return {
@@ -232,6 +396,7 @@ def build_classification_summary(
         "num_classified_paths": len(all_paths),
         "category_counts": {category: len(paths) for category, paths in categories.items()},
         "thresholds": thresholds,
+        "eligibility": eligibility or {},
         "modalities": {
             modality: sum(1 for path in all_paths if path.get("path_modality") == modality)
             for modality in sorted({path.get("path_modality") for path in all_paths})
@@ -283,6 +448,53 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_forget_effect", type=float, default=0.0)
     parser.add_argument("--min_retain_impact", type=float, default=0.0)
     parser.add_argument(
+        "--min_forget_sufficiency",
+        type=float,
+        default=0.0,
+        help="P_forget requires aggregated Suf greater than this value.",
+    )
+    parser.add_argument(
+        "--allow_zero_sufficiency_forget",
+        action="store_true",
+        default=False,
+        help="Compatibility mode: allow P_forget even when Suf is not positive.",
+    )
+    parser.add_argument(
+        "--allow_partial_patchable_forget",
+        action="store_true",
+        default=False,
+        help="Compatibility mode: allow P_forget even when not every score record is fully patchable.",
+    )
+    parser.add_argument(
+        "--require_saliency_specificity",
+        action="store_true",
+        default=False,
+        help="Require a SalUn/SSD-style forget-vs-retain saliency specificity field before assigning P_forget.",
+    )
+    parser.add_argument(
+        "--saliency_specificity_key",
+        choices=[
+            "saliency_specificity_margin",
+            "saliency_specificity_ratio",
+            "fisher_specificity_margin",
+            "fisher_specificity_ratio",
+        ],
+        default="saliency_specificity_margin",
+    )
+    parser.add_argument("--min_saliency_specificity", type=float, default=0.0)
+    parser.add_argument(
+        "--max_retain_anchor_saliency",
+        type=float,
+        default=None,
+        help="If set, P_forget candidates above this retain-anchor saliency are routed to P_shared by default.",
+    )
+    parser.add_argument(
+        "--demote_high_retain_anchor_to_irrelevant",
+        action="store_true",
+        default=False,
+        help="Compatibility/debug mode: do not route high retain-anchor saliency P_forget candidates to P_shared.",
+    )
+    parser.add_argument(
         "--use_signed_effects",
         action="store_true",
         default=False,
@@ -309,6 +521,14 @@ def main() -> None:
         min_forget_effect=args.min_forget_effect,
         min_retain_impact=args.min_retain_impact,
         include_non_ok=args.include_non_ok,
+        min_forget_sufficiency=args.min_forget_sufficiency,
+        require_positive_forget_sufficiency=not args.allow_zero_sufficiency_forget,
+        require_full_patchable_forget=not args.allow_partial_patchable_forget,
+        require_saliency_specificity=args.require_saliency_specificity,
+        saliency_specificity_key=args.saliency_specificity_key,
+        min_saliency_specificity=args.min_saliency_specificity,
+        max_retain_anchor_saliency=args.max_retain_anchor_saliency,
+        shared_on_retain_anchor_saliency=not args.demote_high_retain_anchor_to_irrelevant,
     )
     written = write_classified_paths(
         categories=categories,

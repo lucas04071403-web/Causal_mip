@@ -38,6 +38,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path_modality", type=str, default="all", choices=["all", "text", "vision_text", "vision"])
     parser.add_argument("--path_pair_bindings", type=str, default=None)
     parser.add_argument("--strict_patchable", action="store_true", default=False)
+    parser.add_argument(
+        "--compute_saliency_specificity",
+        action="store_true",
+        default=False,
+        help="Compute SalUn/SSD-style forget-vs-retain gradient/Fisher specificity fields for Science Q1.",
+    )
+    parser.add_argument("--saliency_gamma", type=float, default=1.0)
+    parser.add_argument("--saliency_eps", type=float, default=1e-6)
     return parser
 
 
@@ -113,6 +121,9 @@ def main() -> None:
                     pair=pair,
                     prepared_batches=prepared_batches,
                     strict=args.strict_patchable,
+                    compute_saliency=args.compute_saliency_specificity,
+                    saliency_gamma=args.saliency_gamma,
+                    saliency_eps=args.saliency_eps,
                 )
             )
 
@@ -122,6 +133,9 @@ def main() -> None:
         "num_paths": len(candidate_paths),
         "num_records": len(records),
         "path_pair_bindings": args.path_pair_bindings,
+        "compute_saliency_specificity": args.compute_saliency_specificity,
+        "saliency_gamma": args.saliency_gamma,
+        "saliency_eps": args.saliency_eps,
         "output_path": args.output,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

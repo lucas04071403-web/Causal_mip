@@ -393,18 +393,42 @@ def _expand_token_positions_for_tensor(token_positions: list[int], tensor: torch
     return list(token_positions)
 
 
-def resolve_candidate_path_targets(
+def _node_diagnostic(node, node_index: int) -> dict[str, Any]:
+    return {
+        "node_index": node_index,
+        "module": node.module,
+        "layer": node.layer,
+        "neuron": node.neuron,
+        "token_selector": node.token_selector,
+    }
+
+
+def _resolved_node_diagnostic(node: ResolvedPathNode, original_node, node_index: int) -> dict[str, Any]:
+    return {
+        **_node_diagnostic(original_node, node_index),
+        "resolved_module": node.module,
+        "resolved_neuron": node.neuron,
+        "module_kind": node.module_kind,
+        "token_positions": list(node.token_positions),
+        "num_token_positions": len(node.token_positions),
+    }
+
+
+def _resolve_candidate_path_targets_with_diagnostics(
     candidate_path: CandidatePath,
     prepared_batch: PreparedSampleBatch,
     strict: bool = False,
     model=None,
-) -> list[ResolvedPathNode]:
+) -> tuple[list[ResolvedPathNode], list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[ResolvedPathNode] = []
-    for node in candidate_path.nodes:
+    resolved_diagnostics: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for node_index, node in enumerate(candidate_path.nodes):
         module_kind = _get_patchable_module_kind(node.module)
         if module_kind is None:
             if strict:
                 raise ValueError(f"Unsupported Step 4 module in MVP path patching: {node.module}")
+            skipped.append({**_node_diagnostic(node, node_index), "reason": "unsupported_module"})
             continue
         resolved_module = node.module
         neuron = node.neuron
@@ -415,6 +439,7 @@ def resolve_candidate_path_targets(
                 if resolved_projector is None:
                     if strict:
                         raise ValueError(f"Projector module not found for path node: {node.module}")
+                    skipped.append({**_node_diagnostic(node, node_index), "reason": "projector_module_not_found"})
                     continue
                 resolved_module = resolved_projector
         if module_kind in {"vision", "projector"} and node.token_selector == "image_tokens":
@@ -426,21 +451,66 @@ def resolve_candidate_path_targets(
                 raise ValueError(
                     f"No token positions resolved for selector={node.token_selector} in path {candidate_path.path_id}"
                 )
+            skipped.append({**_node_diagnostic(node, node_index), "reason": "no_token_positions"})
             continue
-        resolved.append(
-            ResolvedPathNode(
-                module=resolved_module,
-                layer=node.layer,
-                neuron=neuron,
-                token_selector=node.token_selector,
-                token_positions=token_positions,
-                module_kind=module_kind,
-            )
+        resolved_node = ResolvedPathNode(
+            module=resolved_module,
+            layer=node.layer,
+            neuron=neuron,
+            token_selector=node.token_selector,
+            token_positions=token_positions,
+            module_kind=module_kind,
         )
+        resolved.append(resolved_node)
+        resolved_diagnostics.append(_resolved_node_diagnostic(resolved_node, node, node_index))
 
     if strict and not resolved:
         raise ValueError(f"No patchable nodes resolved for path {candidate_path.path_id}")
+    return resolved, resolved_diagnostics, skipped
+
+
+def resolve_candidate_path_targets(
+    candidate_path: CandidatePath,
+    prepared_batch: PreparedSampleBatch,
+    strict: bool = False,
+    model=None,
+) -> list[ResolvedPathNode]:
+    resolved, _, _ = _resolve_candidate_path_targets_with_diagnostics(
+        candidate_path=candidate_path,
+        prepared_batch=prepared_batch,
+        strict=strict,
+        model=model,
+    )
     return resolved
+
+
+def diagnose_candidate_path_targets(
+    candidate_path: CandidatePath,
+    prepared_batch: PreparedSampleBatch,
+    strict: bool = False,
+    model=None,
+) -> dict[str, Any]:
+    resolved, resolved_diagnostics, skipped = _resolve_candidate_path_targets_with_diagnostics(
+        candidate_path=candidate_path,
+        prepared_batch=prepared_batch,
+        strict=strict,
+        model=model,
+    )
+    contains_projector = any(_is_projector_module(node.module) for node in candidate_path.nodes)
+    projector_nodes = [node for node in candidate_path.nodes if _is_projector_module(node.module)]
+    projector_patchable = any(node.module_kind == "projector" for node in resolved)
+    return {
+        "num_nodes": len(candidate_path.nodes),
+        "num_patchable_nodes": len(resolved),
+        "num_skipped_nodes": len(skipped),
+        "resolved_nodes": resolved_diagnostics,
+        "skipped_nodes": skipped,
+        "contains_projector": contains_projector,
+        "projector_patchable": projector_patchable,
+        "num_projector_nodes": len(projector_nodes),
+        "num_patchable_projector_nodes": sum(1 for node in resolved if node.module_kind == "projector"),
+        "all_nodes_patchable": len(resolved) == len(candidate_path.nodes),
+    }
 
 
 def compute_target_answer_logprob(

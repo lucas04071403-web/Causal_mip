@@ -8,13 +8,14 @@ import torch
 
 from causal_mip.causal_scores.necessity import compute_necessity
 from causal_mip.causal_scores.retain_impact import compute_retain_impact
+from causal_mip.causal_scores.saliency_specificity import compute_path_saliency_specificity
 from causal_mip.causal_scores.sufficiency import compute_sufficiency
 from causal_mip.interventions.activation_cache import (
     PreparedSampleBatch,
     SampleReferenceResolver,
+    diagnose_candidate_path_targets,
     extract_pair_sample,
     prepare_sample_batch,
-    resolve_candidate_path_targets,
 )
 from causal_mip.path_localization.path_schema import CandidatePath
 
@@ -142,9 +143,17 @@ def compute_path_causal_score_record(
     pair: dict[str, Any],
     prepared_batches: dict[str, PreparedSampleBatch],
     strict: bool = False,
+    compute_saliency: bool = False,
+    saliency_gamma: float = 1.0,
+    saliency_eps: float = 1e-6,
 ) -> dict[str, Any]:
     clean_batch = prepared_batches["forget_clean"]
-    resolved_nodes = resolve_candidate_path_targets(candidate_path, clean_batch, strict=False, model=model)
+    path_diagnostics = diagnose_candidate_path_targets(
+        candidate_path=candidate_path,
+        prepared_batch=clean_batch,
+        strict=False,
+        model=model,
+    )
 
     record = {
         "pair_id": pair.get("pair_id"),
@@ -153,14 +162,22 @@ def compute_path_causal_score_record(
         "path_modality": candidate_path.modality,
         "mip_score": candidate_path.mip_score,
         "num_nodes": len(candidate_path.nodes),
-        "num_patchable_nodes": len(resolved_nodes),
+        "num_patchable_nodes": path_diagnostics["num_patchable_nodes"],
+        "num_skipped_nodes": path_diagnostics["num_skipped_nodes"],
+        "all_nodes_patchable": path_diagnostics["all_nodes_patchable"],
+        "contains_projector": path_diagnostics["contains_projector"],
+        "projector_patchable": path_diagnostics["projector_patchable"],
+        "num_projector_nodes": path_diagnostics["num_projector_nodes"],
+        "num_patchable_projector_nodes": path_diagnostics["num_patchable_projector_nodes"],
+        "resolved_nodes": path_diagnostics["resolved_nodes"],
+        "skipped_nodes": path_diagnostics["skipped_nodes"],
         "sufficiency_corrupt_source": prepared_batches["forget_corrupt_target_clean_answer"].sample.get(
             "step5_corrupt_source",
             "forget_corrupt",
         ),
     }
 
-    if not resolved_nodes:
+    if not path_diagnostics["resolved_nodes"]:
         record.update(
             {
                 "status": "no_patchable_nodes",
@@ -198,6 +215,21 @@ def compute_path_causal_score_record(
         candidate_path=candidate_path,
         strict=strict,
     )
+    saliency = None
+    if compute_saliency:
+        saliency = compute_path_saliency_specificity(
+            model=model,
+            forget_batch=clean_batch,
+            retain_batches={
+                key: value
+                for key, value in prepared_batches.items()
+                if key in {"same_topic", "same_reasoning", "counterfactual_retain"}
+            },
+            candidate_path=candidate_path,
+            strict=strict,
+            gamma=saliency_gamma,
+            eps=saliency_eps,
+        )
 
     record.update(
         {
@@ -205,12 +237,38 @@ def compute_path_causal_score_record(
             "Nec": necessity["necessity"],
             "Suf": sufficiency["sufficiency"],
             "Ret": retain["retain_impact"],
+            "necessity_clean_score": necessity["clean_score"],
+            "necessity_ablated_score": necessity["ablated_score"],
+            "sufficiency_clean_score": sufficiency["clean_score"],
+            "sufficiency_corrupt_score": sufficiency["corrupt_score"],
+            "sufficiency_restored_score": sufficiency["restored_score"],
+            "sufficiency_positive": sufficiency["sufficiency"] is not None and sufficiency["sufficiency"] > 0.0,
+            "target_answer_text": sufficiency["clean_target"].get("target_answer_text"),
+            "clean_answer_token_positions": sufficiency["clean_target"].get("answer_token_positions"),
+            "corrupt_answer_token_positions": sufficiency["corrupt_target"].get("answer_token_positions"),
             "necessity": necessity,
             "sufficiency": sufficiency,
             "retain_impact": retain["retain_impact"],
             "retain_details": retain["retain_details"],
         }
     )
+    if saliency is not None:
+        record.update(
+            {
+                "saliency_status": saliency["status"],
+                "forget_saliency": saliency["forget_saliency"],
+                "retain_anchor_saliency": saliency["retain_anchor_saliency"],
+                "saliency_specificity_margin": saliency["saliency_specificity_margin"],
+                "saliency_specificity_ratio": saliency["saliency_specificity_ratio"],
+                "forget_fisher_saliency": saliency["forget_fisher_saliency"],
+                "retain_anchor_fisher_saliency": saliency["retain_anchor_fisher_saliency"],
+                "fisher_specificity_margin": saliency["fisher_specificity_margin"],
+                "fisher_specificity_ratio": saliency["fisher_specificity_ratio"],
+                "saliency_gamma": saliency["gamma"],
+                "saliency_eps": saliency["eps"],
+                "saliency_specificity": saliency,
+            }
+        )
     return record
 
 

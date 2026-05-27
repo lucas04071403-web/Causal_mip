@@ -130,7 +130,8 @@ causal_mip/path_localization/
 ├── mip_topk_wrapper.py
 ├── beam_search_paths.py
 ├── cross_modal_path_builder.py
-└── cached_path_export.py
+├── cached_path_export.py
+└── saliency_specific_export.py
 ```
 
 | 文件 | 作用 |
@@ -140,6 +141,7 @@ causal_mip/path_localization/
 | `beam_search_paths.py` | 视觉 Fisher / IFI top-k path 搜索 |
 | `cross_modal_path_builder.py` | vision-text 跨模态路径构建 |
 | `cached_path_export.py` | 从缓存导出 `P_cand.jsonl` |
+| `saliency_specific_export.py` | 从 Step5 saliency scores 导出 forget-specific `P_cand` 和绑定文件 |
 
 ### 2.2 data_pairs
 
@@ -196,6 +198,8 @@ causal_mip/causal_scores/
 ├── necessity.py
 ├── sufficiency.py
 ├── retain_impact.py
+├── saliency_specificity.py
+├── specificity_probe.py
 ├── classify_paths.py
 └── build_scores.py
 ```
@@ -206,6 +210,8 @@ causal_mip/causal_scores/
 | `necessity.py` | `Nec(P)` 必要性计算 |
 | `sufficiency.py` | `Suf(P)` 充分性计算 |
 | `retain_impact.py` | `Ret(P)` retain impact 计算 |
+| `saliency_specificity.py` | SalUn/SSD 风格 forget-vs-retain gradient/Fisher specificity 计算 |
+| `specificity_probe.py` | 基于 Step5 聚合结果导出 specificity ranking / projector probe |
 | `classify_paths.py` | `P_forget/P_shared/P_retain/P_irrelevant` 四分类 |
 | `build_scores.py` | 批量 path score 生成入口 |
 
