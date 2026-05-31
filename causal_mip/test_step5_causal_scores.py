@@ -96,11 +96,13 @@ def _prepared_batch(
     answer_positions=None,
     image_positions=None,
     pixel_values: torch.Tensor | None = None,
+    sample: dict | None = None,
+    target_answer_text: str = "a",
 ) -> PreparedSampleBatch:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
     return PreparedSampleBatch(
-        sample={"question": "q", "answer": "a"},
+        sample=sample or {"question": "q", "answer": target_answer_text},
         model_inputs={
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -114,12 +116,22 @@ def _prepared_batch(
         answer_token_positions=answer_positions or [2, 3],
         all_token_positions=[0, 1, 2, 3],
         prompt_length=2,
-        target_answer_text="a",
+        target_answer_text=target_answer_text,
     )
 
 
 class DummyTokenizer:
     pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=False):
+        del add_special_tokens
+        vocab = {
+            "Alice Smith": [3, 4],
+            "Bob Jones": [4, 5],
+            "Cara Doe": [6, 7],
+            "Dina Ray": [8, 9],
+        }
+        return {"input_ids": vocab.get(text, [(ord(char) % 29) + 1 for char in text])}
 
 
 class DummyProcessor:
@@ -273,6 +285,14 @@ def test_path_saliency_specificity():
     assert saliency["forget_saliency"] >= 0.0
     assert saliency["retain_anchor_saliency"] >= 0.0
     assert saliency["saliency_specificity_ratio"] >= 0.0
+    assert saliency["max_anchor_retain_saliency"] >= saliency["retain_anchor_saliency"]
+    assert saliency["min_anchor_margin"] <= saliency["saliency_specificity_margin"]
+    assert saliency["min_anchor_ratio"] >= 0.0
+    assert set(saliency["retain_anchor_margins"].keys()) == {
+        "same_topic",
+        "same_reasoning",
+        "counterfactual_retain",
+    }
     assert saliency["forget"]["num_scored_nodes"] == 2
     assert set(saliency["retain_anchors"].keys()) == {"same_topic", "same_reasoning", "counterfactual_retain"}
 
@@ -380,6 +400,55 @@ def test_vision_text_projector_path_causal_scores():
     assert "model.mm_projector" in restored_modules
 
 
+def test_step5_can_emit_name_token_scores():
+    torch.manual_seed(19)
+    model = ToyModel()
+    candidate_path = _candidate_path()
+    clean_batch = _prepared_batch(
+        torch.tensor([[1, 2, 3, 4]]),
+        sample={"question": "q", "answer": "Alice Smith is here.", "name": "Alice Smith"},
+        target_answer_text="Alice Smith is here.",
+    )
+    corrupt_batch = _prepared_batch(
+        torch.tensor([[1, 2, 3, 4]]),
+        sample={"question": "q", "answer": "Alice Smith is here.", "name": "Alice Smith"},
+        target_answer_text="Alice Smith is here.",
+    )
+    retain_batches = {
+        "same_topic": _prepared_batch(
+            torch.tensor([[1, 2, 4, 5]]),
+            sample={"question": "q", "answer": "Bob Jones is here.", "name": "Bob Jones"},
+            target_answer_text="Bob Jones is here.",
+        )
+    }
+
+    record = compute_path_causal_score_record(
+        model=model,
+        candidate_path=candidate_path,
+        pair={"pair_id": "pair_name"},
+        prepared_batches={
+            "forget_clean": clean_batch,
+            "forget_corrupt_target_clean_answer": corrupt_batch,
+            **retain_batches,
+        },
+        processor_or_tokenizer=DummyProcessor(),
+        strict=True,
+        compute_name_scores=True,
+    )
+
+    assert record["status"] == "ok"
+    assert record["name_score_status"] == "ok"
+    assert record["target_name"] == "Alice Smith"
+    assert record["name_match_status"] == "matched"
+    assert record["clean_name_token_positions"] == [2, 3]
+    assert record["corrupt_name_token_positions"] == [2, 3]
+    assert record["NameNec"] is not None
+    assert record["NameSuf"] is not None
+    assert record["NameRet"] is not None
+    assert record["name_forget_effect"] is not None
+    assert record["name_retain_impact"] is not None
+
+
 def test_step5_falls_back_when_corrupt_input_matches_clean():
     model = ToyModel()
     pair = {
@@ -413,6 +482,7 @@ def main():
     test_path_saliency_specificity()
     test_vision_path_causal_scores()
     test_vision_text_projector_path_causal_scores()
+    test_step5_can_emit_name_token_scores()
     test_step5_falls_back_when_corrupt_input_matches_clean()
     print("Step 5 causal-score tests passed.")
 

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from causal_mip.causal_scores.metrics import (
     build_pair_prepared_batches,
@@ -35,9 +41,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_paths", type=int, default=None)
     parser.add_argument("--pair_start", type=int, default=0)
     parser.add_argument("--path_start", type=int, default=0)
+    parser.add_argument("--pair_ids", nargs="*", default=None, help="Optional pair_id allowlist applied before slicing.")
     parser.add_argument("--path_modality", type=str, default="all", choices=["all", "text", "vision_text", "vision"])
     parser.add_argument("--path_pair_bindings", type=str, default=None)
     parser.add_argument("--strict_patchable", action="store_true", default=False)
+    parser.add_argument(
+        "--compute_name_token_scores",
+        action="store_true",
+        default=False,
+        help="Also compute Step10 NameNec/NameSuf/NameRet fields scoped to target-name tokens.",
+    )
     parser.add_argument(
         "--compute_saliency_specificity",
         action="store_true",
@@ -46,6 +59,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--saliency_gamma", type=float, default=1.0)
     parser.add_argument("--saliency_eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--saliency_max_dim_scores",
+        type=int,
+        default=0,
+        help="If > 0, keep top per-dimension saliency scores for whole-vector nodes such as projectors.",
+    )
+    parser.add_argument(
+        "--retain_anchor_types",
+        nargs="*",
+        choices=["same_topic", "same_reasoning", "counterfactual_retain"],
+        default=None,
+        help="Optional subset of retain anchors to use for Ret and saliency specificity.",
+    )
     return parser
 
 
@@ -90,6 +116,9 @@ def main() -> None:
     pairs = load_pairs_jsonl(args.pairs_path)
     candidate_paths = load_candidate_paths_jsonl(args.candidate_paths_path)
     candidate_paths = filter_candidate_paths_for_step5(candidate_paths, modality_filter=args.path_modality)
+    if args.pair_ids:
+        allowed_pair_ids = set(args.pair_ids)
+        pairs = [pair for pair in pairs if pair.get("pair_id") in allowed_pair_ids]
     pairs = _slice_records(pairs, args.pair_start, args.num_pairs)
     candidate_paths = _slice_records(candidate_paths, args.path_start, args.num_paths)
     candidate_paths_by_id = {path.path_id: path for path in candidate_paths}
@@ -120,10 +149,14 @@ def main() -> None:
                     candidate_path=candidate_path,
                     pair=pair,
                     prepared_batches=prepared_batches,
+                    processor_or_tokenizer=processor,
                     strict=args.strict_patchable,
+                    compute_name_scores=args.compute_name_token_scores,
                     compute_saliency=args.compute_saliency_specificity,
                     saliency_gamma=args.saliency_gamma,
                     saliency_eps=args.saliency_eps,
+                    saliency_max_dim_scores=args.saliency_max_dim_scores,
+                    retain_anchor_types=set(args.retain_anchor_types) if args.retain_anchor_types else None,
                 )
             )
 
@@ -132,10 +165,14 @@ def main() -> None:
         "num_pairs": len(pairs),
         "num_paths": len(candidate_paths),
         "num_records": len(records),
+        "pair_ids": args.pair_ids,
         "path_pair_bindings": args.path_pair_bindings,
         "compute_saliency_specificity": args.compute_saliency_specificity,
+        "compute_name_token_scores": args.compute_name_token_scores,
         "saliency_gamma": args.saliency_gamma,
         "saliency_eps": args.saliency_eps,
+        "saliency_max_dim_scores": args.saliency_max_dim_scores,
+        "retain_anchor_types": args.retain_anchor_types,
         "output_path": args.output,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

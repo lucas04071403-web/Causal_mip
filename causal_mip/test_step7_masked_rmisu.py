@@ -16,6 +16,7 @@ from causal_mip.editing.masked_rmisu import (
     apply_masked_rmisu_parameter_mask,
     build_path_neuron_masks,
     masked_rmisu_finetune,
+    _labels_for_answer_without_name_ce,
     _labels_for_target_ce,
 )
 from partial_linear import PartialLinear
@@ -108,13 +109,14 @@ def _write_jsonl(path: Path, records):
             handle.write(json.dumps(record) + "\n")
 
 
-def _candidate(path_id, nodes):
+def _candidate(path_id, nodes, metadata=None):
     return {
         "path_id": path_id,
         "source": "test",
         "modality": "text",
         "mip_score": 1.0,
         "nodes": nodes,
+        "metadata": metadata or {},
     }
 
 
@@ -145,6 +147,10 @@ def _projector_node(neuron=0):
     }
 
 
+def _projector_dim_candidate(path_id, nodes):
+    return _candidate(path_id, nodes, metadata={"projector_dim_level": True})
+
+
 def _batch(offset=0):
     input_ids = torch.tensor([[1 + offset, 2 + offset, 3 + offset, 4 + offset]]) % 20
     attention_mask = torch.ones_like(input_ids)
@@ -161,6 +167,16 @@ def _batch_with_items(offset=0):
     pixel_values = torch.zeros(1, 3, 2, 2)
     image_grid_thw = torch.ones(1, 3, dtype=torch.long)
     item_list = [{"answer_token_positions": [2, 3], "name_token_positions": [2]}]
+    return input_ids, attention_mask, pixel_values, image_grid_thw, labels, item_list
+
+
+def _batch_without_name_items(offset=0):
+    input_ids = torch.tensor([[1 + offset, 2 + offset, 3 + offset, 4 + offset]]) % 20
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    pixel_values = torch.zeros(1, 3, 2, 2)
+    image_grid_thw = torch.ones(1, 3, dtype=torch.long)
+    item_list = [{"answer_token_positions": [2, 3], "name_token_positions": []}]
     return input_ids, attention_mask, pixel_values, image_grid_thw, labels, item_list
 
 
@@ -245,7 +261,7 @@ def test_projector_mask_is_reported_and_skipped():
         _write_jsonl(
             candidates_path,
             [
-                _candidate("projector_forget_path", [_projector_node(0), _node(1, 3)]),
+                _projector_dim_candidate("projector_forget_path", [_projector_node(0), _node(1, 3)]),
             ],
         )
         _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
@@ -271,8 +287,8 @@ def test_projector_linear_mask_build_and_parameter_wrap():
         _write_jsonl(
             candidates_path,
             [
-                _candidate("projector_forget_path", [_projector_node(3), _node(1, 4)]),
-                _candidate("projector_shared_path", [_projector_node(5)]),
+                _projector_dim_candidate("projector_forget_path", [_projector_node(3), _node(1, 4)]),
+                _projector_dim_candidate("projector_shared_path", [_projector_node(5)]),
             ],
         )
         _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
@@ -294,6 +310,40 @@ def test_projector_linear_mask_build_and_parameter_wrap():
         assert model.model.mm_projector.trainable_cols == [3]
 
 
+def test_projector_placeholder_uses_whole_vector_mask():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(
+            candidates_path,
+            [
+                _candidate("projector_forget_path", [_projector_node(0)]),
+            ],
+        )
+        _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        masks = build_path_neuron_masks(str(candidates_path), str(p_forget_path), str(p_shared_path))
+        projector_mask = masks["mm_projector"]
+        assert projector_mask.forget_neurons == {-1}
+        assert projector_mask.editable_neurons == {-1}
+
+        model = ToyModel()
+        projector_width = model.model.mm_projector.out_features
+        summary = apply_masked_rmisu_parameter_mask(model, masks)
+        projector_summary = {
+            item["module"]: item
+            for item in summary["modules"]
+            if item["module"] == "mm_projector"
+        }["mm_projector"]
+        assert projector_summary["uses_whole_vector_neuron"] is True
+        assert projector_summary["num_forget_editable_neurons"] == projector_width
+        assert isinstance(model.model.mm_projector, PartialLinear)
+        assert model.model.mm_projector.trainable_cols == list(range(projector_width))
+
+
 def test_projector_probe_overrides_shared_for_weak_edit():
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
@@ -304,8 +354,8 @@ def test_projector_probe_overrides_shared_for_weak_edit():
         _write_jsonl(
             candidates_path,
             [
-                _candidate("projector_probe_path", [_projector_node(3)]),
-                _candidate("projector_shared_path", [_projector_node(3)]),
+                _projector_dim_candidate("projector_probe_path", [_projector_node(3)]),
+                _projector_dim_candidate("projector_shared_path", [_projector_node(3)]),
             ],
         )
         _write_jsonl(p_forget_path, [])
@@ -344,7 +394,7 @@ def test_projector_activation_objective_updates_projector_weights():
         candidates_path = temp / "P_cand.jsonl"
         p_forget_path = temp / "P_forget.jsonl"
         p_shared_path = temp / "P_shared.jsonl"
-        _write_jsonl(candidates_path, [_candidate("projector_forget_path", [_projector_node(3)])])
+        _write_jsonl(candidates_path, [_projector_dim_candidate("projector_forget_path", [_projector_node(3)])])
         _write_jsonl(p_forget_path, [{"path_id": "projector_forget_path"}])
         _write_jsonl(p_shared_path, [])
 
@@ -386,7 +436,7 @@ def test_projector_probe_objective_updates_projector_weights():
         p_forget_path = temp / "P_forget.jsonl"
         p_shared_path = temp / "P_shared.jsonl"
         p_probe_path = temp / "P_projector_probe.jsonl"
-        _write_jsonl(candidates_path, [_candidate("projector_probe_path", [_projector_node(3)])])
+        _write_jsonl(candidates_path, [_projector_dim_candidate("projector_probe_path", [_projector_node(3)])])
         _write_jsonl(p_forget_path, [])
         _write_jsonl(p_shared_path, [])
         _write_jsonl(p_probe_path, [{"path_id": "projector_probe_path"}])
@@ -515,14 +565,28 @@ def test_targeted_forget_ce_masks_answer_and_name_tokens():
     batch = _batch_with_items(2)
     answer_labels, answer_count = _labels_for_target_ce(batch, "answer", torch.device("cpu"))
     name_labels, name_count = _labels_for_target_ce(batch, "name", torch.device("cpu"))
+    answer_without_name_labels, answer_without_name_count = _labels_for_answer_without_name_ce(
+        batch,
+        torch.device("cpu"),
+    )
+    missing_name_labels, missing_name_count = _labels_for_target_ce(
+        _batch_without_name_items(2),
+        "name",
+        torch.device("cpu"),
+    )
 
     assert answer_count == 2
     assert name_count == 1
+    assert answer_without_name_count == 1
+    assert missing_name_labels is None
+    assert missing_name_count == 0
     assert answer_labels[0, 0].item() == -100
     assert answer_labels[0, 2].item() != -100
     assert answer_labels[0, 3].item() != -100
     assert name_labels[0, 2].item() != -100
     assert name_labels[0, 3].item() == -100
+    assert answer_without_name_labels[0, 2].item() == -100
+    assert answer_without_name_labels[0, 3].item() != -100
 
 
 def test_masked_rmisu_name_ce_ascent_objective_smoke():
@@ -565,11 +629,57 @@ def test_masked_rmisu_name_ce_ascent_objective_smoke():
         assert summary["losses"][0]["forget_ce_loss"] != 0.0
 
 
+def test_masked_rmisu_name_preference_unlearning_objective_smoke():
+    torch.manual_seed(17)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("forget_path", [_node(0, 2)])])
+        _write_jsonl(p_forget_path, [{"path_id": "forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        retain_loader = [_batch_with_items(0)]
+        forget_loader = [_batch_with_items(2)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.0,
+            shared_alpha=0.0,
+            forget_objective="name_preference_unlearning",
+            forget_ce_alpha=0.1,
+            preference_positive_alpha=0.2,
+            learning_rate=1e-4,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            config=config,
+        )
+        loss = summary["losses"][0]
+        assert summary["forget_config"]["target_ce_scope"] == "name"
+        assert summary["forget_config"]["preference_positive_alpha"] == 0.2
+        assert loss["forget_ce_token_count"] == 1
+        assert loss["preference_positive_token_count"] == 1
+        assert loss["forget_ce_loss"] != 0.0
+        assert loss["preference_positive_loss"] != 0.0
+
+
 def main():
     test_mask_build_and_parameter_wrap()
     test_vision_mask_build_and_parameter_wrap()
     test_projector_mask_is_reported_and_skipped()
     test_projector_linear_mask_build_and_parameter_wrap()
+    test_projector_placeholder_uses_whole_vector_mask()
     test_projector_probe_overrides_shared_for_weak_edit()
     test_projector_activation_objective_updates_projector_weights()
     test_projector_probe_objective_updates_projector_weights()
@@ -577,6 +687,7 @@ def main():
     test_masked_rmisu_ce_ascent_objective_smoke()
     test_targeted_forget_ce_masks_answer_and_name_tokens()
     test_masked_rmisu_name_ce_ascent_objective_smoke()
+    test_masked_rmisu_name_preference_unlearning_objective_smoke()
     print("Step 7 masked RMisU tests passed.")
 
 

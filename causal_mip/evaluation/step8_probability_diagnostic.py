@@ -19,6 +19,12 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+from causal_mip.causal_scores.name_token_metrics import (
+    compute_logprob_stats,
+    find_subsequence_positions,
+    get_token_ids,
+)
+
 
 IMAGE_CAPTION_QUESTION = "Describe the visible scene and objects in this image without identifying the person."
 MODEL_LABEL_BASELINE = "baseline"
@@ -216,59 +222,6 @@ def build_model_inputs(processor, text: str, image: Image.Image | None, device: 
     return {key: value.to(device) for key, value in inputs.items() if torch.is_tensor(value)}
 
 
-def _token_ids(processor, text: str) -> list[int]:
-    if not text:
-        return []
-    return processor.tokenizer(text, add_special_tokens=False)["input_ids"]
-
-
-def find_subsequence_positions(sequence: list[int], subsequence: list[int]) -> list[int]:
-    if not subsequence or len(subsequence) > len(sequence):
-        return []
-    limit = len(sequence) - len(subsequence) + 1
-    for start in range(limit):
-        if sequence[start : start + len(subsequence)] == subsequence:
-            return list(range(start, start + len(subsequence)))
-    return []
-
-
-def compute_logprob_stats(
-    logits: torch.Tensor,
-    input_ids: torch.Tensor,
-    positions: list[int],
-) -> dict[str, Any]:
-    positions = [position for position in positions if position > 0 and position < input_ids.shape[1]]
-    if not positions:
-        return {
-            "token_count": 0,
-            "mean_logprob": None,
-            "sum_logprob": None,
-            "mean_prob": None,
-            "ce": None,
-            "token_logprobs": [],
-        }
-
-    log_probs = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
-    token_values = []
-    for position in positions:
-        token_id = input_ids[0, position]
-        score_position = position - 1
-        value = log_probs[0, score_position, token_id]
-        token_values.append(value)
-    stacked = torch.stack(token_values)
-    token_logprobs = [float(value.detach().cpu().item()) for value in stacked]
-    mean_logprob = float(stacked.mean().detach().cpu().item())
-    sum_logprob = float(stacked.sum().detach().cpu().item())
-    return {
-        "token_count": len(token_logprobs),
-        "mean_logprob": mean_logprob,
-        "sum_logprob": sum_logprob,
-        "mean_prob": float(torch.exp(stacked).mean().detach().cpu().item()),
-        "ce": -mean_logprob,
-        "token_logprobs": token_logprobs,
-    }
-
-
 def score_target_text(
     model,
     processor,
@@ -294,7 +247,7 @@ def score_target_text(
     answer_positions = list(range(prompt_length, int(full_inputs["attention_mask"][0].sum().item())))
 
     scored_name_text = (name_text if name_text is not None else example.name) or ""
-    name_token_ids = _token_ids(processor, scored_name_text)
+    name_token_ids = get_token_ids(processor, scored_name_text)
     full_token_ids = input_ids[0].detach().cpu().tolist()
     name_positions = find_subsequence_positions(full_token_ids, name_token_ids)
     scoped_name_positions = [position for position in name_positions if position in set(answer_positions)]

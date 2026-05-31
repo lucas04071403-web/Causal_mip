@@ -433,7 +433,8 @@ def _resolve_candidate_path_targets_with_diagnostics(
         resolved_module = node.module
         neuron = node.neuron
         if module_kind == "projector":
-            neuron = WHOLE_VECTOR_NEURON
+            if not bool((candidate_path.metadata or {}).get("projector_dim_level", False)):
+                neuron = WHOLE_VECTOR_NEURON
             if model is not None:
                 resolved_projector = _resolve_projector_module_name(model, node.module)
                 if resolved_projector is None:

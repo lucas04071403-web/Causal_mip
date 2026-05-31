@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from causal_mip.causal_scores.necessity import compute_necessity
+from causal_mip.causal_scores.name_token_metrics import compute_path_name_token_scores
 from causal_mip.causal_scores.retain_impact import compute_retain_impact
 from causal_mip.causal_scores.saliency_specificity import compute_path_saliency_specificity
 from causal_mip.causal_scores.sufficiency import compute_sufficiency
@@ -142,10 +143,14 @@ def compute_path_causal_score_record(
     candidate_path: CandidatePath,
     pair: dict[str, Any],
     prepared_batches: dict[str, PreparedSampleBatch],
+    processor_or_tokenizer=None,
     strict: bool = False,
     compute_saliency: bool = False,
+    compute_name_scores: bool = False,
     saliency_gamma: float = 1.0,
     saliency_eps: float = 1e-6,
+    saliency_max_dim_scores: int = 0,
+    retain_anchor_types: set[str] | None = None,
 ) -> dict[str, Any]:
     clean_batch = prepared_batches["forget_clean"]
     path_diagnostics = diagnose_candidate_path_targets(
@@ -177,6 +182,13 @@ def compute_path_causal_score_record(
         ),
     }
 
+    retain_keys = retain_anchor_types or {"same_topic", "same_reasoning", "counterfactual_retain"}
+    retain_batches = {
+        key: value
+        for key, value in prepared_batches.items()
+        if key in retain_keys
+    }
+
     if not path_diagnostics["resolved_nodes"]:
         record.update(
             {
@@ -184,6 +196,12 @@ def compute_path_causal_score_record(
                 "Nec": None,
                 "Suf": None,
                 "Ret": None,
+                "NameNec": None,
+                "NameSuf": None,
+                "NameRet": None,
+                "name_forget_effect": None,
+                "name_retain_impact": None,
+                "name_score_status": "no_patchable_nodes",
                 "necessity": None,
                 "sufficiency": None,
                 "retain_impact": None,
@@ -207,11 +225,7 @@ def compute_path_causal_score_record(
     )
     retain = compute_retain_impact(
         model=model,
-        retain_batches={
-            key: value
-            for key, value in prepared_batches.items()
-            if key in {"same_topic", "same_reasoning", "counterfactual_retain"}
-        },
+        retain_batches=retain_batches,
         candidate_path=candidate_path,
         strict=strict,
     )
@@ -220,15 +234,25 @@ def compute_path_causal_score_record(
         saliency = compute_path_saliency_specificity(
             model=model,
             forget_batch=clean_batch,
-            retain_batches={
-                key: value
-                for key, value in prepared_batches.items()
-                if key in {"same_topic", "same_reasoning", "counterfactual_retain"}
-            },
+            retain_batches=retain_batches,
             candidate_path=candidate_path,
             strict=strict,
             gamma=saliency_gamma,
             eps=saliency_eps,
+            max_dim_scores=saliency_max_dim_scores,
+        )
+    name_scores = None
+    if compute_name_scores:
+        if processor_or_tokenizer is None:
+            raise ValueError("compute_name_scores=True requires processor_or_tokenizer.")
+        name_scores = compute_path_name_token_scores(
+            model=model,
+            processor_or_tokenizer=processor_or_tokenizer,
+            clean_batch=clean_batch,
+            corrupt_batch=prepared_batches["forget_corrupt_target_clean_answer"],
+            retain_batches=retain_batches,
+            candidate_path=candidate_path,
+            strict=strict,
         )
 
     record.update(
@@ -250,8 +274,11 @@ def compute_path_causal_score_record(
             "sufficiency": sufficiency,
             "retain_impact": retain["retain_impact"],
             "retain_details": retain["retain_details"],
+            "retain_anchor_types": sorted(retain_batches.keys()),
         }
     )
+    if name_scores is not None:
+        record.update(name_scores)
     if saliency is not None:
         record.update(
             {
@@ -260,10 +287,16 @@ def compute_path_causal_score_record(
                 "retain_anchor_saliency": saliency["retain_anchor_saliency"],
                 "saliency_specificity_margin": saliency["saliency_specificity_margin"],
                 "saliency_specificity_ratio": saliency["saliency_specificity_ratio"],
+                "max_anchor_retain_saliency": saliency.get("max_anchor_retain_saliency"),
+                "min_anchor_margin": saliency.get("min_anchor_margin"),
+                "min_anchor_ratio": saliency.get("min_anchor_ratio"),
                 "forget_fisher_saliency": saliency["forget_fisher_saliency"],
                 "retain_anchor_fisher_saliency": saliency["retain_anchor_fisher_saliency"],
                 "fisher_specificity_margin": saliency["fisher_specificity_margin"],
                 "fisher_specificity_ratio": saliency["fisher_specificity_ratio"],
+                "max_anchor_retain_fisher_saliency": saliency.get("max_anchor_retain_fisher_saliency"),
+                "min_anchor_fisher_margin": saliency.get("min_anchor_fisher_margin"),
+                "min_anchor_fisher_ratio": saliency.get("min_anchor_fisher_ratio"),
                 "saliency_gamma": saliency["gamma"],
                 "saliency_eps": saliency["eps"],
                 "saliency_specificity": saliency,

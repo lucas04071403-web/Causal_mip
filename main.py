@@ -118,12 +118,14 @@ parser.add_argument(
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "name_preference_unlearning",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",
     ],
 )
 parser.add_argument("--masked_rmisu_forget_ce_alpha", type=float, default=0.0)
+parser.add_argument("--masked_rmisu_preference_positive_alpha", type=float, default=0.1)
 parser.add_argument(
     "--masked_rmisu_target_ce_scope",
     type=str,

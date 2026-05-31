@@ -15,6 +15,7 @@ from causal_mip.path_localization.path_schema import CandidatePath
 from partial_linear import PartialLinear
 
 ProjectorEditMode = Literal["skip", "qwen_merger_mlp"]
+WHOLE_VECTOR_NEURON = -1
 
 
 @dataclass
@@ -76,6 +77,7 @@ class MaskedRMisUConfig:
     shared_alpha: float = 1.0
     forget_objective: str = "activation_random"
     forget_ce_alpha: float = 0.0
+    preference_positive_alpha: float = 0.1
     target_ce_scope: str = "all"
     projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp"
     steering_coeff: float = 6.5
@@ -156,6 +158,62 @@ def _patchable_down_proj_kind(module_name: str) -> str | None:
     return None
 
 
+def _candidate_projector_uses_dim_level(candidate: CandidatePath) -> bool:
+    return bool((candidate.metadata or {}).get("projector_dim_level", False))
+
+
+def _mask_neuron_for_node(candidate: CandidatePath, node_module_kind: str, neuron: int) -> int:
+    if node_module_kind == "projector" and not _candidate_projector_uses_dim_level(candidate):
+        return WHOLE_VECTOR_NEURON
+    return int(neuron)
+
+
+def _expand_neurons_for_width(neurons: set[int] | Iterable[int], width: int) -> set[int]:
+    values = set(int(neuron) for neuron in neurons)
+    if WHOLE_VECTOR_NEURON in values:
+        return set(range(width))
+    return {neuron for neuron in values if neuron >= 0}
+
+
+def _dimensioned_editable_neurons(mask: PathNeuronMask, width: int) -> set[int]:
+    forget = _expand_neurons_for_width(mask.forget_neurons, width)
+    shared = _expand_neurons_for_width(mask.shared_neurons, width)
+    return forget - shared
+
+
+def _dimensioned_trainable_neurons(mask: PathNeuronMask, width: int) -> set[int]:
+    editable = _dimensioned_editable_neurons(mask, width)
+    probe = _expand_neurons_for_width(mask.probe_neurons, width)
+    return editable | probe
+
+
+def _dimensioned_preserve_neurons(mask: PathNeuronMask, width: int) -> set[int]:
+    return (
+        _expand_neurons_for_width(mask.forget_neurons, width)
+        | _expand_neurons_for_width(mask.shared_neurons, width)
+        | _expand_neurons_for_width(mask.probe_neurons, width)
+    )
+
+
+def _summary_with_dimensioned_neurons(mask: PathNeuronMask, width: int) -> dict[str, Any]:
+    editable = sorted(_dimensioned_editable_neurons(mask, width))
+    trainable = sorted(_dimensioned_trainable_neurons(mask, width))
+    preserve = sorted(_dimensioned_preserve_neurons(mask, width))
+    summary = mask.to_summary()
+    summary.update(
+        {
+            "num_forget_editable_neurons": len(editable),
+            "num_editable_neurons": len(trainable),
+            "num_preserve_neurons": len(preserve),
+            "uses_whole_vector_neuron": any(
+                WHOLE_VECTOR_NEURON in neurons
+                for neurons in (mask.forget_neurons, mask.shared_neurons, mask.probe_neurons)
+            ),
+        }
+    )
+    return summary
+
+
 def _resolve_projector_edit_module(
     model: nn.Module,
     module_name: str,
@@ -223,7 +281,7 @@ def build_path_neuron_masks(
             if module_kind is None:
                 continue
             mask = ensure_mask(node.module, node.layer, module_kind)
-            mask.forget_neurons.add(int(node.neuron))
+            mask.forget_neurons.add(_mask_neuron_for_node(candidate, module_kind, node.neuron))
             mask.forget_path_ids.add(path_id)
 
     for path_id in sorted(shared_ids):
@@ -235,7 +293,7 @@ def build_path_neuron_masks(
             if module_kind is None:
                 continue
             mask = ensure_mask(node.module, node.layer, module_kind)
-            mask.shared_neurons.add(int(node.neuron))
+            mask.shared_neurons.add(_mask_neuron_for_node(candidate, module_kind, node.neuron))
             mask.shared_path_ids.add(path_id)
 
     for path_id in sorted(probe_ids):
@@ -247,7 +305,7 @@ def build_path_neuron_masks(
             if module_kind is None:
                 continue
             mask = ensure_mask(node.module, node.layer, module_kind)
-            mask.probe_neurons.add(int(node.neuron))
+            mask.probe_neurons.add(_mask_neuron_for_node(candidate, module_kind, node.neuron))
             mask.probe_path_ids.add(path_id)
 
     return masks
@@ -297,8 +355,7 @@ def apply_masked_rmisu_parameter_mask(
     }
 
     for down_proj_name, mask in sorted(masks.items()):
-        trainable = sorted(mask.trainable_neurons)
-        if not trainable:
+        if not mask.trainable_neurons:
             summary["skipped_modules"].append(
                 {"module": down_proj_name, "reason": "no_editable_neurons"}
             )
@@ -323,6 +380,18 @@ def apply_masked_rmisu_parameter_mask(
                 continue
             try:
                 linear = get_module(model, edit_module_name)
+                if isinstance(linear, PartialLinear):
+                    width = linear.num_columns
+                elif isinstance(linear, nn.Linear):
+                    width = linear.out_features
+                else:
+                    raise TypeError(f"Expected nn.Linear or PartialLinear, got {type(linear)}")
+                trainable = sorted(_dimensioned_trainable_neurons(mask, width))
+                if not trainable:
+                    summary["skipped_modules"].append(
+                        {"module": down_proj_name, "reason": "no_editable_neurons"}
+                    )
+                    continue
                 wrapped = _wrap_linear_with_partial(linear, trainable)
                 _replace_child_module(model, edit_module_name, wrapped)
             except (KeyError, TypeError, IndexError):
@@ -340,10 +409,10 @@ def apply_masked_rmisu_parameter_mask(
             summary["num_probe_neurons"] += len(mask.probe_neurons)
             summary["modules"].append(
                 {
-                    **mask.to_summary(),
+                    **_summary_with_dimensioned_neurons(mask, width),
                     "editable_neurons": trainable,
-                    "forget_editable_neurons": sorted(mask.editable_neurons),
-                    "probe_neurons": sorted(mask.probe_neurons),
+                    "forget_editable_neurons": sorted(_dimensioned_editable_neurons(mask, width)),
+                    "probe_neurons": sorted(_expand_neurons_for_width(mask.probe_neurons, width)),
                     "edit_module": edit_module_name,
                 }
             )
@@ -364,19 +433,32 @@ def apply_masked_rmisu_parameter_mask(
                 if strict:
                     raise KeyError(f"{mlp_name}.{proj_name} not found")
                 continue
-            wrapped = _wrap_linear_with_partial(getattr(mlp, proj_name), trainable)
+            target_linear = getattr(mlp, proj_name)
+            if isinstance(target_linear, PartialLinear):
+                width = target_linear.num_columns
+            else:
+                width = target_linear.out_features
+            trainable = sorted(_dimensioned_trainable_neurons(mask, width))
+            if not trainable:
+                break
+            wrapped = _wrap_linear_with_partial(target_linear, trainable)
             _replace_child_module(model, f"{mlp_name}.{proj_name}", wrapped)
+        if not trainable:
+            summary["skipped_modules"].append(
+                {"module": down_proj_name, "reason": "no_editable_neurons"}
+            )
+            continue
 
         summary["num_modules"] += 1
         summary["num_editable_neurons"] += len(trainable)
-        summary["num_probe_neurons"] += len(mask.probe_neurons)
+        summary["num_probe_neurons"] += len(_expand_neurons_for_width(mask.probe_neurons, width))
         mask.active = True
         summary["modules"].append(
             {
-                **mask.to_summary(),
+                **_summary_with_dimensioned_neurons(mask, width),
                 "editable_neurons": trainable,
-                "forget_editable_neurons": sorted(mask.editable_neurons),
-                "probe_neurons": sorted(mask.probe_neurons),
+                "forget_editable_neurons": sorted(_dimensioned_editable_neurons(mask, width)),
+                "probe_neurons": sorted(_expand_neurons_for_width(mask.probe_neurons, width)),
                 "edit_module": down_proj_name,
             }
         )
@@ -415,39 +497,45 @@ class DownProjInputTracer:
         self.handles = []
         self.activations: dict[str, torch.Tensor] = {}
 
-    def _neurons_for_mask(self, mask: PathNeuronMask) -> list[int]:
+    def _raw_neurons_for_mask(self, mask: PathNeuronMask) -> set[int]:
         if self.neuron_kind == "editable":
-            return sorted(mask.editable_neurons)
+            return mask.editable_neurons
         if self.neuron_kind == "probe":
-            return sorted(mask.probe_neurons)
+            return mask.probe_neurons
         if self.neuron_kind == "trainable":
-            return sorted(mask.trainable_neurons)
+            return mask.trainable_neurons
         if self.neuron_kind == "shared":
-            return sorted(mask.shared_neurons)
+            return mask.shared_neurons
         if self.neuron_kind == "preserve":
-            return sorted(mask.preserve_neurons)
+            return mask.preserve_neurons
         raise ValueError(f"Unsupported neuron_kind: {self.neuron_kind}")
 
     def __enter__(self):
         for module_name, mask in sorted(self.masks.items()):
             if not mask.active:
                 continue
-            neurons = self._neurons_for_mask(mask)
-            if not neurons:
+            raw_neurons = self._raw_neurons_for_mask(mask)
+            if not raw_neurons:
                 continue
             trace_module_name = mask.trace_module or module_name
             module = get_module(self.model, trace_module_name)
 
-            def pre_hook(current_module, inputs, module_name=module_name, neurons=neurons):
+            def pre_hook(current_module, inputs, module_name=module_name, raw_neurons=raw_neurons):
                 tensor = inputs[0] if isinstance(inputs, tuple) else inputs
+                neurons = sorted(_expand_neurons_for_width(raw_neurons, tensor.shape[-1]))
+                if not neurons:
+                    return None
                 selected = tensor[..., neurons]
                 if self.detach:
                     selected = selected.detach()
                 self.activations[module_name] = selected
                 return None
 
-            def forward_hook(current_module, inputs, output, module_name=module_name, neurons=neurons):
+            def forward_hook(current_module, inputs, output, module_name=module_name, raw_neurons=raw_neurons):
                 tensor = output[0] if isinstance(output, tuple) else output
+                neurons = sorted(_expand_neurons_for_width(raw_neurons, tensor.shape[-1]))
+                if not neurons:
+                    return None
                 selected = tensor[..., neurons]
                 if self.detach:
                     selected = selected.detach()
@@ -553,8 +641,6 @@ def _labels_for_target_ce(batch, scope: str, device: torch.device) -> tuple[torc
     masked_labels = torch.full_like(labels, -100)
     for row_idx, item in enumerate(item_list[: labels.shape[0]]):
         positions = _metadata_positions(item, scope)
-        if scope == "name" and not positions:
-            positions = _metadata_positions(item, "answer")
         for position in positions:
             if 0 <= position < labels.shape[1] and labels[row_idx, position] != -100:
                 masked_labels[row_idx, position] = labels[row_idx, position]
@@ -562,9 +648,29 @@ def _labels_for_target_ce(batch, scope: str, device: torch.device) -> tuple[torc
     token_count = int((masked_labels != -100).detach().sum().cpu().item())
     if token_count == 0:
         if scope == "name":
-            return _labels_for_target_ce(batch, "answer", device)
+            return None, 0
         token_count = int((labels != -100).detach().sum().cpu().item())
         return labels, token_count
+    return masked_labels, token_count
+
+
+def _labels_for_answer_without_name_ce(batch, device: torch.device) -> tuple[torch.Tensor | None, int]:
+    labels = _batch_labels(batch)
+    if labels is None:
+        return None, 0
+    labels = labels.to(device)
+    item_list = _batch_item_list(batch)
+    masked_labels = torch.full_like(labels, -100)
+    for row_idx, item in enumerate(item_list[: labels.shape[0]]):
+        answer_positions = set(_metadata_positions(item, "answer"))
+        name_positions = set(_metadata_positions(item, "name"))
+        for position in sorted(answer_positions - name_positions):
+            if 0 <= position < labels.shape[1] and labels[row_idx, position] != -100:
+                masked_labels[row_idx, position] = labels[row_idx, position]
+
+    token_count = int((masked_labels != -100).detach().sum().cpu().item())
+    if token_count == 0:
+        return None, 0
     return masked_labels, token_count
 
 
@@ -615,6 +721,7 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "name_preference_unlearning",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",
@@ -628,6 +735,7 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "name_preference_unlearning",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",
@@ -650,6 +758,7 @@ def _ce_scope_for_objective(config: MaskedRMisUConfig) -> str:
         "answer_ce_ascent": "answer",
         "activation_random_answer_ce": "answer",
         "name_ce_ascent": "name",
+        "name_preference_unlearning": "name",
         "activation_random_name_ce": "name",
     }
     return objective_to_scope.get(config.forget_objective, config.target_ce_scope)
@@ -741,6 +850,7 @@ def masked_rmisu_finetune(
                 "ce_ascent",
                 "answer_ce_ascent",
                 "name_ce_ascent",
+                "name_preference_unlearning",
             }:
                 target_ce_scope = _ce_scope_for_objective(config)
                 target_labels, forget_ce_token_count = _labels_for_target_ce(
@@ -750,6 +860,16 @@ def masked_rmisu_finetune(
                 )
                 if target_labels is not None:
                     forget_ce_loss = _targeted_ce_loss(forget_output.logits, target_labels)
+
+            preference_positive_loss = torch.tensor(0.0, device=device)
+            preference_positive_token_count = 0
+            if config.forget_objective == "name_preference_unlearning":
+                positive_labels, preference_positive_token_count = _labels_for_answer_without_name_ce(
+                    forget_batch,
+                    device,
+                )
+                if positive_labels is not None:
+                    preference_positive_loss = _targeted_ce_loss(forget_output.logits, positive_labels)
 
             retain_loss = torch.tensor(0.0, device=device)
             shared_loss = torch.tensor(0.0, device=device)
@@ -785,6 +905,7 @@ def masked_rmisu_finetune(
                 + config.probe_beta * probe_loss
                 + config.alpha * retain_loss
                 + config.shared_alpha * shared_loss
+                + config.preference_positive_alpha * preference_positive_loss
                 - config.forget_ce_alpha * forget_ce_loss
             )
             loss.backward()
@@ -801,6 +922,8 @@ def masked_rmisu_finetune(
                 "forget_objective": config.forget_objective,
                 "forget_ce_scope": _ce_scope_for_objective(config),
                 "forget_ce_token_count": forget_ce_token_count,
+                "preference_positive_loss": float(preference_positive_loss.detach().cpu().item()),
+                "preference_positive_token_count": preference_positive_token_count,
                 "retain_loss": float(retain_loss.detach().cpu().item()),
                 "shared_loss": float(shared_loss.detach().cpu().item()),
             }
@@ -811,6 +934,7 @@ def masked_rmisu_finetune(
                     unlearn=record["unlearn_loss"],
                     probe=record["probe_loss"],
                     forget_ce=record["forget_ce_loss"],
+                    pref_pos=record["preference_positive_loss"],
                     retain=record["retain_loss"],
                     shared=record["shared_loss"],
                 )
@@ -829,6 +953,7 @@ def masked_rmisu_finetune(
         "forget_config": {
             "forget_objective": config.forget_objective,
             "forget_ce_alpha": config.forget_ce_alpha,
+            "preference_positive_alpha": config.preference_positive_alpha,
             "target_ce_scope": _ce_scope_for_objective(config),
         },
         "num_loss_records": len(losses),

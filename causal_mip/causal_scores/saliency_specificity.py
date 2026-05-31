@@ -54,6 +54,7 @@ def _node_saliency_from_activation_grad(
     activation: torch.Tensor,
     gradient: torch.Tensor,
     node: ResolvedPathNode,
+    max_dim_scores: int = 0,
 ) -> dict[str, Any]:
     token_positions = _expand_token_positions(node.token_positions, activation)
     if not token_positions:
@@ -68,12 +69,30 @@ def _node_saliency_from_activation_grad(
     selected_gradient = _select_node_tensor(gradient, token_positions, node.neuron).detach()
     grad_act = torch.abs(selected_activation * selected_gradient)
     fisher = selected_gradient.pow(2)
-    return {
+    result = {
         "saliency": float(grad_act.mean().detach().cpu().item()),
         "fisher_saliency": float(fisher.mean().detach().cpu().item()),
         "num_token_positions": len(token_positions),
         "status": "ok",
     }
+    if node.neuron == WHOLE_VECTOR_NEURON and max_dim_scores > 0 and grad_act.ndim >= 2:
+        reduce_dims = tuple(range(grad_act.ndim - 1))
+        dim_saliency = grad_act.mean(dim=reduce_dims)
+        dim_fisher = fisher.mean(dim=reduce_dims)
+        k = min(int(max_dim_scores), int(dim_saliency.numel()))
+        if k > 0:
+            top_values, top_indices = torch.topk(dim_saliency, k=k)
+            result["dim_scores"] = [
+                {
+                    "dim_index": int(dim_index.detach().cpu().item()),
+                    "saliency": float(value.detach().cpu().item()),
+                    "fisher_saliency": float(dim_fisher[int(dim_index)].detach().cpu().item()),
+                    "status": "ok",
+                }
+                for value, dim_index in zip(top_values, top_indices)
+            ]
+            result["num_dim_scores"] = k
+    return result
 
 
 def _summarize_node_scores(
@@ -103,6 +122,7 @@ def _compute_saliency_with_existing_graph(
     prepared_batch: PreparedSampleBatch,
     candidate_path: CandidatePath,
     resolved_nodes: list[ResolvedPathNode],
+    max_dim_scores: int = 0,
 ) -> tuple[dict[str, Any], set[tuple[str, int, int]]]:
     captured: dict[str, torch.Tensor] = {}
     handles = []
@@ -172,7 +192,7 @@ def _compute_saliency_with_existing_graph(
                     }
                 )
                 continue
-            node_scores.append({**base, **_node_saliency_from_activation_grad(activation, gradient, node)})
+            node_scores.append({**base, **_node_saliency_from_activation_grad(activation, gradient, node, max_dim_scores)})
 
         status = "ok" if not missing else "partial_missing_gradients"
         return _summarize_node_scores(candidate_path, resolved_nodes, node_scores, status), missing
@@ -187,6 +207,7 @@ def _compute_leaf_saliency_for_module_nodes(
     prepared_batch: PreparedSampleBatch,
     candidate_path: CandidatePath,
     nodes: list[tuple[int, ResolvedPathNode]],
+    max_dim_scores: int = 0,
 ) -> list[dict[str, Any]]:
     module_name = nodes[0][1].module
     captured: dict[str, torch.Tensor] = {}
@@ -246,7 +267,7 @@ def _compute_leaf_saliency_for_module_nodes(
                     }
                 )
                 continue
-            node_scores.append({**base, **_node_saliency_from_activation_grad(activation, gradient, node)})
+            node_scores.append({**base, **_node_saliency_from_activation_grad(activation, gradient, node, max_dim_scores)})
         return node_scores
     finally:
         handle.remove()
@@ -258,6 +279,7 @@ def compute_batch_path_saliency(
     prepared_batch: PreparedSampleBatch,
     candidate_path: CandidatePath,
     strict: bool = False,
+    max_dim_scores: int = 0,
 ) -> dict[str, Any]:
     resolved_nodes = resolve_candidate_path_targets(
         candidate_path=candidate_path,
@@ -283,6 +305,7 @@ def compute_batch_path_saliency(
         prepared_batch=prepared_batch,
         candidate_path=candidate_path,
         resolved_nodes=resolved_nodes,
+        max_dim_scores=max_dim_scores,
     )
     if not missing:
         return summary
@@ -300,6 +323,7 @@ def compute_batch_path_saliency(
             prepared_batch=prepared_batch,
             candidate_path=candidate_path,
             nodes=nodes,
+            max_dim_scores=max_dim_scores,
         ):
             replacement_scores[int(node_score["node_index"])] = node_score
 
@@ -320,12 +344,14 @@ def compute_path_saliency_specificity(
     strict: bool = False,
     gamma: float = 1.0,
     eps: float = 1e-6,
+    max_dim_scores: int = 0,
 ) -> dict[str, Any]:
     forget = compute_batch_path_saliency(
         model=model,
         prepared_batch=forget_batch,
         candidate_path=candidate_path,
         strict=strict,
+        max_dim_scores=max_dim_scores,
     )
     if forget.get("saliency") is None:
         return {
@@ -350,6 +376,7 @@ def compute_path_saliency_specificity(
             prepared_batch=retain_batch,
             candidate_path=candidate_path,
             strict=strict,
+            max_dim_scores=max_dim_scores,
         )
         for retain_name, retain_batch in retain_batches.items()
     }
@@ -368,6 +395,48 @@ def compute_path_saliency_specificity(
     forget_fisher_saliency = float(forget["fisher_saliency"])
     retain_anchor_saliency = float(mean(retain_saliencies)) if retain_saliencies else 0.0
     retain_anchor_fisher_saliency = float(mean(retain_fisher_saliencies)) if retain_fisher_saliencies else 0.0
+    max_anchor_retain_saliency = max(retain_saliencies) if retain_saliencies else retain_anchor_saliency
+    max_anchor_retain_fisher_saliency = (
+        max(retain_fisher_saliencies) if retain_fisher_saliencies else retain_anchor_fisher_saliency
+    )
+    per_anchor_saliency = {
+        retain_name: float(result["saliency"])
+        for retain_name, result in retain_results.items()
+        if result.get("saliency") is not None
+    }
+    per_anchor_fisher_saliency = {
+        retain_name: float(result["fisher_saliency"])
+        for retain_name, result in retain_results.items()
+        if result.get("fisher_saliency") is not None
+    }
+    per_anchor_margin = {
+        retain_name: forget_saliency - gamma * retain_saliency
+        for retain_name, retain_saliency in per_anchor_saliency.items()
+    }
+    per_anchor_ratio = {
+        retain_name: forget_saliency / (retain_saliency + eps)
+        for retain_name, retain_saliency in per_anchor_saliency.items()
+    }
+    per_anchor_fisher_margin = {
+        retain_name: forget_fisher_saliency - gamma * retain_fisher
+        for retain_name, retain_fisher in per_anchor_fisher_saliency.items()
+    }
+    per_anchor_fisher_ratio = {
+        retain_name: forget_fisher_saliency / (retain_fisher + eps)
+        for retain_name, retain_fisher in per_anchor_fisher_saliency.items()
+    }
+    min_anchor_margin = min(per_anchor_margin.values()) if per_anchor_margin else forget_saliency - gamma * retain_anchor_saliency
+    min_anchor_ratio = min(per_anchor_ratio.values()) if per_anchor_ratio else forget_saliency / (retain_anchor_saliency + eps)
+    min_anchor_fisher_margin = (
+        min(per_anchor_fisher_margin.values())
+        if per_anchor_fisher_margin
+        else forget_fisher_saliency - gamma * retain_anchor_fisher_saliency
+    )
+    min_anchor_fisher_ratio = (
+        min(per_anchor_fisher_ratio.values())
+        if per_anchor_fisher_ratio
+        else forget_fisher_saliency / (retain_anchor_fisher_saliency + eps)
+    )
     return {
         "status": "ok" if retain_results else "ok_no_retain_anchors",
         "forget": forget,
@@ -376,10 +445,20 @@ def compute_path_saliency_specificity(
         "retain_anchor_saliency": retain_anchor_saliency,
         "saliency_specificity_margin": forget_saliency - gamma * retain_anchor_saliency,
         "saliency_specificity_ratio": forget_saliency / (retain_anchor_saliency + eps),
+        "max_anchor_retain_saliency": max_anchor_retain_saliency,
+        "min_anchor_margin": min_anchor_margin,
+        "min_anchor_ratio": min_anchor_ratio,
+        "retain_anchor_margins": per_anchor_margin,
+        "retain_anchor_ratios": per_anchor_ratio,
         "forget_fisher_saliency": forget_fisher_saliency,
         "retain_anchor_fisher_saliency": retain_anchor_fisher_saliency,
         "fisher_specificity_margin": forget_fisher_saliency - gamma * retain_anchor_fisher_saliency,
         "fisher_specificity_ratio": forget_fisher_saliency / (retain_anchor_fisher_saliency + eps),
+        "max_anchor_retain_fisher_saliency": max_anchor_retain_fisher_saliency,
+        "min_anchor_fisher_margin": min_anchor_fisher_margin,
+        "min_anchor_fisher_ratio": min_anchor_fisher_ratio,
+        "retain_anchor_fisher_margins": per_anchor_fisher_margin,
+        "retain_anchor_fisher_ratios": per_anchor_fisher_ratio,
         "gamma": gamma,
         "eps": eps,
     }
