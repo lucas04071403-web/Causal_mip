@@ -311,12 +311,13 @@ ce_ascent
 answer_ce_ascent
 name_ce_ascent
 name_preference_unlearning
+redacted_name_preference
 ```
 
 当前推荐重点：
 
 ```text
-forget_objective = name_preference_unlearning 或 name_ce_ascent
+forget_objective = name_ce_ascent 或 redacted_name_preference
 forget_ce_scope = name
 projector_edit_mode 指向 Qwen projector edit module: visual.merger.mlp.0
 projector-dim candidate 优先于 whole-vector projector
@@ -329,7 +330,21 @@ projector-dim candidate 优先于 whole-vector projector
 正向：保留 answer_without_name token。
 ```
 
-注意：它还不是完整的 redacted-name preference。下一步应构造真正的 `redacted / unknown-person / generic identity` positive target。
+`redacted_name_preference` 当前语义：
+
+```text
+负向：压低 target name token。
+正向：在 name span 上监督 generic identity token，例如 "The person"。
+```
+
+当前实验结论：
+
+```text
+redacted_name_preference 已实现并通过 Step7 单测和 GPU smoke。
+全答案 redacted positive 会抵消姓名压制，不再作为主配置。
+name-span redacted positive 可恢复正向压制，但仍未通过 cheap gate。
+当前最佳行为配置仍是 top8/31-dim + name_ce_ascent ce=0.30。
+```
 
 ### 3.6 evaluation
 
@@ -416,21 +431,28 @@ forget_clean name_hit 反而高于 baseline。
 
 | run | candidate | objective | 参数方向 | 目标 |
 | --- | --- | --- | --- | --- |
-| I | projector-dim | `name_preference_unlearning` | `ce=0.30, pos=0.05` | 减少 positive preserve 抵消 |
-| J | projector-dim | `name_ce_ascent` | `ce=0.30` | 测试 dim-level 纯姓名压制强度 |
-| K | projector-dim | full `redacted_name_preference` | beta 待定 | 构造真正 y_pos/y_neg preference |
-| L | projector-dim + more dims | `name_ce_ascent` 或 preference | top 8 paths / 32 dims | 测试 16 dims 是否太少 |
+| I | projector-dim top8 / 31 dims | `name_ce_ascent` | `ce=0.30`, checkpoint sweep | 当前最佳行为配置，找最佳早停点 |
+| J | projector-dim top8 / 31 dims | `redacted_name_preference` | name-span positive, `beta=0.005/0.01/0.02` | 测试低权重替代身份目标 |
+| K | projector-dim top12 / 48 dims | `name_ce_ascent` | `ce=0.30` | 测试 31 dims 是否仍覆盖不足 |
+| L | projector-dim top8 重筛 | `name_ce_ascent` | 排除 NameRet 偏高 path 对照 | 修 counterfactual_retain 边界问题 |
 
-当前阶段不建议直接扩大 Full CLEAR，因为最近一次 projector-dim name-pref cheap gate 仍未通过：
+当前阶段不建议直接扩大 Full CLEAR，因为 Step11 projector-dim top8 cheap gate 仍未完全通过：
 
 ```text
-forget_clean target_name_ce delta = +0.000038
-forget_clean name_hit = 0.7778
+当前最佳 forget 行为：
+step11_top8_name_ce030
+forget_clean target_name_ce delta = +0.002199
+forget_clean name_hit = 0.5556
 counterfactual_retain name_hit = 0.6667
-hard_retain name_hit = 0.6944
+hard_retain name_hit = 0.7222
+
+当前最佳 CE delta：
+step11_top8_name_ce050
+forget_clean target_name_ce delta = +0.003591
+forget_clean name_hit = 0.6667
 ```
 
-这说明工程闭环成立，但行为效果还不够。
+这说明 top8/31-dim 扩容有实际改善，但 target_name_ce delta 仍未达到 +0.01。
 
 ---
 
@@ -511,9 +533,11 @@ docs/
 ├── MACHINE_UNLEARNING_SURVEY_OPTIMIZATION_ROUTE.md
 ├── MIP_Editor_Summary.md
 ├── NEXT_OPTIMIZATION_DISCUSSION_0527.md
+├── NEXT_ROUTE_TARGET_NAME_PROJECTOR_DIM_OPTIMIZATION.md
 ├── SCIENCE_Q1_IMPLEMENTATION_AND_EXPERIMENTS.md
 ├── SCIENCE_Q1_MAIN_REPORT.md
 ├── SCIENCE_Q1_NEXT_STEPS.md
+├── STEP11_PROJECTOR_DIM_TARGET_NAME_OPTIMIZATION_RESULT_0531.md
 ├── STEP10_NAME_TOKEN_ALIGNED_ROUTE_0530.md
 ├── STEP10_NEXT_OPTIMIZATION_FROM_UNLEARNING_SURVEY_0530.md
 ├── STEP2_TO_STEP8_CODE_REVIEW_REPORT.md
@@ -538,9 +562,11 @@ docs/
 | `MACHINE_UNLEARNING_SURVEY_OPTIMIZATION_ROUTE.md` | 基于 unlearning survey 的优化路线 |
 | `MIP_Editor_Summary.md` | MIP-Editor 概览总结 |
 | `NEXT_OPTIMIZATION_DISCUSSION_0527.md` | 0527 下一步优化讨论 |
+| `NEXT_ROUTE_TARGET_NAME_PROJECTOR_DIM_OPTIMIZATION.md` | target-name projector-dim 下一轮优化路线 |
 | `SCIENCE_Q1_IMPLEMENTATION_AND_EXPERIMENTS.md` | 科学问题 1 实现与实验 |
 | `SCIENCE_Q1_MAIN_REPORT.md` | 科学问题 1 主报告 |
 | `SCIENCE_Q1_NEXT_STEPS.md` | 科学问题 1 后续计划 |
+| `STEP11_PROJECTOR_DIM_TARGET_NAME_OPTIMIZATION_RESULT_0531.md` | Step11 top8/31-dim 与 redacted objective 实验验证结果 |
 | `STEP2_TO_STEP8_CODE_REVIEW_REPORT.md` | Step2-Step8 代码审查报告 |
 | `STEP2_TO_STEP8_IMPLEMENTATION_SUMMARY.md` | Step2-Step8 汇总实现说明 |
 | `STEP9_CAUSAL_SELECTIVE_EDITING_CLOSURE_RUNBOOK.md` | Step9 闭环实验 runbook，当前主要作为历史对照 |

@@ -85,7 +85,20 @@ def _target_token_metadata(tokenizer, input_ids, labels, item, answer):
     answer_position_set = set(item["answer_token_positions"])
     answer_name_positions = [position for position in name_positions if position in answer_position_set]
     item["name_token_positions"] = answer_name_positions or name_positions
+    redacted_answer = _redacted_positive_answer(item, answer)
+    item["redacted_positive_answer"] = redacted_answer
+    item["redacted_positive_token_ids"] = _tokenize_without_special_tokens(tokenizer, redacted_answer)
+    item["redacted_name_token_ids"] = _tokenize_without_special_tokens(tokenizer, "The person")
     return item
+
+
+def _redacted_positive_answer(item, answer):
+    name = item.get("name")
+    if name and answer and name in answer:
+        redacted = answer.replace(name, "The person", 1).strip()
+        if redacted:
+            return redacted
+    return "The person is unknown."
 
 
 class CLEAR_Dataset(Dataset):

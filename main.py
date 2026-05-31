@@ -119,6 +119,7 @@ parser.add_argument(
         "answer_ce_ascent",
         "name_ce_ascent",
         "name_preference_unlearning",
+        "redacted_name_preference",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",

@@ -674,6 +674,38 @@ def _labels_for_answer_without_name_ce(batch, device: torch.device) -> tuple[tor
     return masked_labels, token_count
 
 
+def _labels_for_redacted_positive_ce(batch, device: torch.device) -> tuple[torch.Tensor | None, int]:
+    labels = _batch_labels(batch)
+    if labels is None:
+        return None, 0
+    labels = labels.to(device)
+    item_list = _batch_item_list(batch)
+    masked_labels = torch.full_like(labels, -100)
+    for row_idx, item in enumerate(item_list[: labels.shape[0]]):
+        if not isinstance(item, dict):
+            continue
+        name_positions = _metadata_positions(item, "name")
+        positive_token_ids = item.get("redacted_name_token_ids")
+        if not name_positions:
+            continue
+        if not isinstance(positive_token_ids, list):
+            positive_token_ids = item.get("redacted_positive_token_ids")
+        if not isinstance(positive_token_ids, list):
+            continue
+        positions = name_positions[: len(positive_token_ids)]
+        for offset, token_id in enumerate(positive_token_ids):
+            if offset >= len(positions):
+                break
+            position = positions[offset]
+            if 0 <= position < labels.shape[1] and labels[row_idx, position] != -100:
+                masked_labels[row_idx, position] = int(token_id)
+
+    token_count = int((masked_labels != -100).detach().sum().cpu().item())
+    if token_count == 0:
+        return None, 0
+    return masked_labels, token_count
+
+
 def _targeted_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
@@ -722,6 +754,7 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "answer_ce_ascent",
         "name_ce_ascent",
         "name_preference_unlearning",
+        "redacted_name_preference",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",
@@ -736,6 +769,7 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "answer_ce_ascent",
         "name_ce_ascent",
         "name_preference_unlearning",
+        "redacted_name_preference",
         "activation_random_ce",
         "activation_random_answer_ce",
         "activation_random_name_ce",
@@ -759,6 +793,7 @@ def _ce_scope_for_objective(config: MaskedRMisUConfig) -> str:
         "activation_random_answer_ce": "answer",
         "name_ce_ascent": "name",
         "name_preference_unlearning": "name",
+        "redacted_name_preference": "name",
         "activation_random_name_ce": "name",
     }
     return objective_to_scope.get(config.forget_objective, config.target_ce_scope)
@@ -851,6 +886,7 @@ def masked_rmisu_finetune(
                 "answer_ce_ascent",
                 "name_ce_ascent",
                 "name_preference_unlearning",
+                "redacted_name_preference",
             }:
                 target_ce_scope = _ce_scope_for_objective(config)
                 target_labels, forget_ce_token_count = _labels_for_target_ce(
@@ -863,11 +899,17 @@ def masked_rmisu_finetune(
 
             preference_positive_loss = torch.tensor(0.0, device=device)
             preference_positive_token_count = 0
-            if config.forget_objective == "name_preference_unlearning":
-                positive_labels, preference_positive_token_count = _labels_for_answer_without_name_ce(
-                    forget_batch,
-                    device,
-                )
+            if config.forget_objective in {"name_preference_unlearning", "redacted_name_preference"}:
+                if config.forget_objective == "redacted_name_preference":
+                    positive_labels, preference_positive_token_count = _labels_for_redacted_positive_ce(
+                        forget_batch,
+                        device,
+                    )
+                else:
+                    positive_labels, preference_positive_token_count = _labels_for_answer_without_name_ce(
+                        forget_batch,
+                        device,
+                    )
                 if positive_labels is not None:
                     preference_positive_loss = _targeted_ce_loss(forget_output.logits, positive_labels)
 
