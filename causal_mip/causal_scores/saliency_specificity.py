@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from causal_mip.causal_scores.name_token_metrics import find_name_token_positions
 from causal_mip.interventions.activation_cache import (
     ALL_VISUAL_TOKEN_POSITIONS,
     WHOLE_VECTOR_NEURON,
@@ -95,6 +96,59 @@ def _node_saliency_from_activation_grad(
     return result
 
 
+def compute_target_name_logprob(
+    logits: torch.Tensor,
+    prepared_batch: PreparedSampleBatch,
+    processor_or_tokenizer,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    target_name = prepared_batch.sample.get("name", "")
+    location = find_name_token_positions(
+        processor_or_tokenizer=processor_or_tokenizer,
+        input_ids=prepared_batch.input_ids,
+        answer_positions=list(prepared_batch.answer_token_positions),
+        target_text=prepared_batch.target_answer_text,
+        name_text=target_name,
+    )
+    positions = [
+        position
+        for position in location["name_token_positions"]
+        if position > 0 and position < prepared_batch.input_ids.shape[1]
+    ]
+    if not positions:
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    contributions = []
+    for position in positions:
+        score_position = position - 1
+        token_id = prepared_batch.input_ids[:, position]
+        contributions.append(log_probs[:, score_position, :].gather(-1, token_id.unsqueeze(-1)).squeeze(-1))
+    stacked = torch.stack(contributions, dim=0)
+    if reduction == "sum":
+        return stacked.sum()
+    return stacked.mean()
+
+
+def _compute_saliency_score(
+    logits: torch.Tensor,
+    prepared_batch: PreparedSampleBatch,
+    target: str,
+    processor_or_tokenizer=None,
+) -> torch.Tensor:
+    if target == "answer":
+        return compute_target_answer_logprob(logits, prepared_batch)
+    if target == "target_name":
+        if processor_or_tokenizer is None:
+            raise ValueError("target_name saliency requires processor_or_tokenizer.")
+        return compute_target_name_logprob(
+            logits=logits,
+            prepared_batch=prepared_batch,
+            processor_or_tokenizer=processor_or_tokenizer,
+        )
+    raise ValueError(f"Unsupported saliency target: {target}")
+
+
 def _summarize_node_scores(
     candidate_path: CandidatePath,
     resolved_nodes: list[ResolvedPathNode],
@@ -123,6 +177,8 @@ def _compute_saliency_with_existing_graph(
     candidate_path: CandidatePath,
     resolved_nodes: list[ResolvedPathNode],
     max_dim_scores: int = 0,
+    target: str = "answer",
+    processor_or_tokenizer=None,
 ) -> tuple[dict[str, Any], set[tuple[str, int, int]]]:
     captured: dict[str, torch.Tensor] = {}
     handles = []
@@ -145,7 +201,12 @@ def _compute_saliency_with_existing_graph(
         model.zero_grad(set_to_none=True)
         with torch.enable_grad():
             outputs = model(**prepared_batch.model_inputs)
-            score = compute_target_answer_logprob(outputs.logits, prepared_batch)
+            score = _compute_saliency_score(
+                logits=outputs.logits,
+                prepared_batch=prepared_batch,
+                target=target,
+                processor_or_tokenizer=processor_or_tokenizer,
+            )
             if not bool(getattr(score, "requires_grad", False)):
                 node_scores = [
                     {
@@ -208,6 +269,8 @@ def _compute_leaf_saliency_for_module_nodes(
     candidate_path: CandidatePath,
     nodes: list[tuple[int, ResolvedPathNode]],
     max_dim_scores: int = 0,
+    target: str = "answer",
+    processor_or_tokenizer=None,
 ) -> list[dict[str, Any]]:
     module_name = nodes[0][1].module
     captured: dict[str, torch.Tensor] = {}
@@ -225,7 +288,12 @@ def _compute_leaf_saliency_for_module_nodes(
         model.zero_grad(set_to_none=True)
         with torch.enable_grad():
             outputs = model(**prepared_batch.model_inputs)
-            score = compute_target_answer_logprob(outputs.logits, prepared_batch)
+            score = _compute_saliency_score(
+                logits=outputs.logits,
+                prepared_batch=prepared_batch,
+                target=target,
+                processor_or_tokenizer=processor_or_tokenizer,
+            )
             if not bool(getattr(score, "requires_grad", False)):
                 return [
                     {
@@ -280,6 +348,8 @@ def compute_batch_path_saliency(
     candidate_path: CandidatePath,
     strict: bool = False,
     max_dim_scores: int = 0,
+    target: str = "answer",
+    processor_or_tokenizer=None,
 ) -> dict[str, Any]:
     resolved_nodes = resolve_candidate_path_targets(
         candidate_path=candidate_path,
@@ -306,6 +376,8 @@ def compute_batch_path_saliency(
         candidate_path=candidate_path,
         resolved_nodes=resolved_nodes,
         max_dim_scores=max_dim_scores,
+        target=target,
+        processor_or_tokenizer=processor_or_tokenizer,
     )
     if not missing:
         return summary
@@ -324,6 +396,8 @@ def compute_batch_path_saliency(
             candidate_path=candidate_path,
             nodes=nodes,
             max_dim_scores=max_dim_scores,
+            target=target,
+            processor_or_tokenizer=processor_or_tokenizer,
         ):
             replacement_scores[int(node_score["node_index"])] = node_score
 
@@ -345,6 +419,8 @@ def compute_path_saliency_specificity(
     gamma: float = 1.0,
     eps: float = 1e-6,
     max_dim_scores: int = 0,
+    target: str = "answer",
+    processor_or_tokenizer=None,
 ) -> dict[str, Any]:
     forget = compute_batch_path_saliency(
         model=model,
@@ -352,6 +428,8 @@ def compute_path_saliency_specificity(
         candidate_path=candidate_path,
         strict=strict,
         max_dim_scores=max_dim_scores,
+        target=target,
+        processor_or_tokenizer=processor_or_tokenizer,
     )
     if forget.get("saliency") is None:
         return {
@@ -377,6 +455,8 @@ def compute_path_saliency_specificity(
             candidate_path=candidate_path,
             strict=strict,
             max_dim_scores=max_dim_scores,
+            target=target,
+            processor_or_tokenizer=processor_or_tokenizer,
         )
         for retain_name, retain_batch in retain_batches.items()
     }
@@ -461,4 +541,5 @@ def compute_path_saliency_specificity(
         "retain_anchor_fisher_ratios": per_anchor_fisher_ratio,
         "gamma": gamma,
         "eps": eps,
+        "target": target,
     }

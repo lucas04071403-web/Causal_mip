@@ -118,6 +118,8 @@ parser.add_argument(
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "bounded_name_ce_ascent",
+        "pii_name_token_noise",
         "name_preference_unlearning",
         "redacted_name_preference",
         "activation_random_ce",
@@ -127,6 +129,9 @@ parser.add_argument(
 )
 parser.add_argument("--masked_rmisu_forget_ce_alpha", type=float, default=0.0)
 parser.add_argument("--masked_rmisu_preference_positive_alpha", type=float, default=0.1)
+parser.add_argument("--masked_rmisu_bounded_delta_l2_alpha", type=float, default=0.0)
+parser.add_argument("--masked_rmisu_bounded_delta_max_norm", type=float, default=None)
+parser.add_argument("--masked_rmisu_pii_noise_alpha", type=float, default=0.0)
 parser.add_argument(
     "--masked_rmisu_target_ce_scope",
     type=str,

@@ -78,6 +78,9 @@ class MaskedRMisUConfig:
     forget_objective: str = "activation_random"
     forget_ce_alpha: float = 0.0
     preference_positive_alpha: float = 0.1
+    bounded_delta_l2_alpha: float = 0.0
+    bounded_delta_max_norm: float | None = None
+    pii_noise_alpha: float = 0.0
     target_ce_scope: str = "all"
     projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp"
     steering_coeff: float = 6.5
@@ -716,6 +719,49 @@ def _targeted_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tenso
     )
 
 
+def _targeted_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+    active = shift_labels != -100
+    if not bool(active.detach().any().cpu().item()):
+        return torch.tensor(0.0, device=shift_logits.device)
+    log_probs = torch.nn.functional.log_softmax(shift_logits[active], dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return entropy.mean()
+
+
+def _partial_linear_delta_l2_loss(model: nn.Module) -> torch.Tensor:
+    losses = []
+    for module in model.modules():
+        if isinstance(module, PartialLinear):
+            losses.append(torch.nn.functional.mse_loss(module.trainable_weight, module.original_linear.weight[module.trainable_cols, :].to(module.trainable_weight.device)))
+            if module.trainable_bias is not None and module.original_linear.bias is not None:
+                losses.append(torch.nn.functional.mse_loss(module.trainable_bias, module.original_linear.bias[module.trainable_cols].to(module.trainable_bias.device)))
+    if not losses:
+        return torch.tensor(0.0, device=_model_device(model))
+    return torch.stack(losses).mean()
+
+
+def _clip_partial_linear_delta_(model: nn.Module, max_norm: float | None) -> None:
+    if max_norm is None or max_norm <= 0:
+        return
+    with torch.no_grad():
+        for module in model.modules():
+            if not isinstance(module, PartialLinear):
+                continue
+            base_weight = module.original_linear.weight[module.trainable_cols, :].to(module.trainable_weight.device)
+            delta = module.trainable_weight - base_weight
+            flat_delta = delta.reshape(delta.shape[0], -1)
+            norms = flat_delta.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            scale = (float(max_norm) / norms).clamp(max=1.0).view(-1, *([1] * (delta.ndim - 1)))
+            module.trainable_weight.copy_(base_weight + delta * scale)
+            if module.trainable_bias is not None and module.original_linear.bias is not None:
+                base_bias = module.original_linear.bias[module.trainable_cols].to(module.trainable_bias.device)
+                bias_delta = module.trainable_bias - base_bias
+                module.trainable_bias.copy_(base_bias + bias_delta.clamp(min=-float(max_norm), max=float(max_norm)))
+
+
 def _activation_mse_to_random(
     activations: dict[str, torch.Tensor],
     steering_coeff: float,
@@ -753,6 +799,8 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "bounded_name_ce_ascent",
+        "pii_name_token_noise",
         "name_preference_unlearning",
         "redacted_name_preference",
         "activation_random_ce",
@@ -768,6 +816,8 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
         "ce_ascent",
         "answer_ce_ascent",
         "name_ce_ascent",
+        "bounded_name_ce_ascent",
+        "pii_name_token_noise",
         "name_preference_unlearning",
         "redacted_name_preference",
         "activation_random_ce",
@@ -792,6 +842,8 @@ def _ce_scope_for_objective(config: MaskedRMisUConfig) -> str:
         "answer_ce_ascent": "answer",
         "activation_random_answer_ce": "answer",
         "name_ce_ascent": "name",
+        "bounded_name_ce_ascent": "name",
+        "pii_name_token_noise": "name",
         "name_preference_unlearning": "name",
         "redacted_name_preference": "name",
         "activation_random_name_ce": "name",
@@ -885,6 +937,8 @@ def masked_rmisu_finetune(
                 "ce_ascent",
                 "answer_ce_ascent",
                 "name_ce_ascent",
+                "bounded_name_ce_ascent",
+                "pii_name_token_noise",
                 "name_preference_unlearning",
                 "redacted_name_preference",
             }:
@@ -896,6 +950,14 @@ def masked_rmisu_finetune(
                 )
                 if target_labels is not None:
                     forget_ce_loss = _targeted_ce_loss(forget_output.logits, target_labels)
+
+            pii_noise_loss = torch.tensor(0.0, device=device)
+            if config.forget_objective == "pii_name_token_noise" and target_labels is not None:
+                pii_noise_loss = _targeted_entropy_loss(forget_output.logits, target_labels)
+
+            bounded_delta_l2_loss = torch.tensor(0.0, device=device)
+            if config.forget_objective == "bounded_name_ce_ascent" and config.bounded_delta_l2_alpha != 0.0:
+                bounded_delta_l2_loss = _partial_linear_delta_l2_loss(updated_model).to(device)
 
             preference_positive_loss = torch.tensor(0.0, device=device)
             preference_positive_token_count = 0
@@ -948,10 +1010,14 @@ def masked_rmisu_finetune(
                 + config.alpha * retain_loss
                 + config.shared_alpha * shared_loss
                 + config.preference_positive_alpha * preference_positive_loss
+                + config.bounded_delta_l2_alpha * bounded_delta_l2_loss
                 - config.forget_ce_alpha * forget_ce_loss
+                - config.pii_noise_alpha * pii_noise_loss
             )
             loss.backward()
             optimizer.step()
+            if config.forget_objective == "bounded_name_ce_ascent":
+                _clip_partial_linear_delta_(updated_model, config.bounded_delta_max_norm)
             lr_scheduler.step()
 
             record = {
@@ -966,6 +1032,8 @@ def masked_rmisu_finetune(
                 "forget_ce_token_count": forget_ce_token_count,
                 "preference_positive_loss": float(preference_positive_loss.detach().cpu().item()),
                 "preference_positive_token_count": preference_positive_token_count,
+                "pii_noise_loss": float(pii_noise_loss.detach().cpu().item()),
+                "bounded_delta_l2_loss": float(bounded_delta_l2_loss.detach().cpu().item()),
                 "retain_loss": float(retain_loss.detach().cpu().item()),
                 "shared_loss": float(shared_loss.detach().cpu().item()),
             }
@@ -977,6 +1045,8 @@ def masked_rmisu_finetune(
                     probe=record["probe_loss"],
                     forget_ce=record["forget_ce_loss"],
                     pref_pos=record["preference_positive_loss"],
+                    pii_noise=record["pii_noise_loss"],
+                    bound_l2=record["bounded_delta_l2_loss"],
                     retain=record["retain_loss"],
                     shared=record["shared_loss"],
                 )
@@ -996,6 +1066,9 @@ def masked_rmisu_finetune(
             "forget_objective": config.forget_objective,
             "forget_ce_alpha": config.forget_ce_alpha,
             "preference_positive_alpha": config.preference_positive_alpha,
+            "bounded_delta_l2_alpha": config.bounded_delta_l2_alpha,
+            "bounded_delta_max_norm": config.bounded_delta_max_norm,
+            "pii_noise_alpha": config.pii_noise_alpha,
             "target_ce_scope": _ce_scope_for_objective(config),
         },
         "num_loss_records": len(losses),

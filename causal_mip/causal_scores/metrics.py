@@ -150,6 +150,7 @@ def compute_path_causal_score_record(
     saliency_gamma: float = 1.0,
     saliency_eps: float = 1e-6,
     saliency_max_dim_scores: int = 0,
+    saliency_target: str = "answer",
     retain_anchor_types: set[str] | None = None,
 ) -> dict[str, Any]:
     clean_batch = prepared_batches["forget_clean"]
@@ -166,6 +167,7 @@ def compute_path_causal_score_record(
         "path_source": candidate_path.source,
         "path_modality": candidate_path.modality,
         "mip_score": candidate_path.mip_score,
+        "candidate_metadata": candidate_path.metadata or {},
         "num_nodes": len(candidate_path.nodes),
         "num_patchable_nodes": path_diagnostics["num_patchable_nodes"],
         "num_skipped_nodes": path_diagnostics["num_skipped_nodes"],
@@ -240,6 +242,8 @@ def compute_path_causal_score_record(
             gamma=saliency_gamma,
             eps=saliency_eps,
             max_dim_scores=saliency_max_dim_scores,
+            target=saliency_target,
+            processor_or_tokenizer=processor_or_tokenizer,
         )
     name_scores = None
     if compute_name_scores:
@@ -299,6 +303,7 @@ def compute_path_causal_score_record(
                 "min_anchor_fisher_ratio": saliency.get("min_anchor_fisher_ratio"),
                 "saliency_gamma": saliency["gamma"],
                 "saliency_eps": saliency["eps"],
+                "saliency_target": saliency.get("target", saliency_target),
                 "saliency_specificity": saliency,
             }
         )

@@ -84,6 +84,33 @@ def _aggregate_optional_float(
     return _aggregate(values, aggregation)
 
 
+def _selected_dim_metric(record: dict[str, Any], key: str) -> float | None:
+    metadata = record.get("candidate_metadata") or record.get("metadata") or {}
+    values = []
+    for dim_record in metadata.get("selected_projector_dims", []) or []:
+        value = _as_float(dim_record.get(key))
+        if value is not None:
+            values.append(value)
+    if values:
+        return float(mean(values))
+    value = _as_float(metadata.get(f"mean_selected_{key}"))
+    if value is not None:
+        return value
+    return _as_float(record.get(f"mean_selected_{key}"))
+
+
+def _aggregate_selected_dim_metric(
+    records: list[dict[str, Any]],
+    key: str,
+    aggregation: str,
+) -> float | None:
+    values = [_selected_dim_metric(record, key) for record in records]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return _aggregate(values, aggregation)
+
+
 def aggregate_path_score_records(
     records: list[dict[str, Any]],
     alpha: float = 1.0,
@@ -145,6 +172,19 @@ def aggregate_path_score_records(
         name_editable_score = None
         if name_forget_effect is not None:
             name_editable_score = float(name_forget_effect) / (1e-6 + float(name_retain_impact or 0.0))
+        selected_salun_ssd_score = _aggregate_selected_dim_metric(path_records, "salun_ssd_score", aggregation)
+        selected_fisher_specificity_margin = _aggregate_selected_dim_metric(
+            path_records,
+            "fisher_specificity_margin",
+            aggregation,
+        )
+        name_salun_ssd_editable_score = None
+        if name_forget_effect is not None and selected_salun_ssd_score is not None:
+            name_salun_ssd_editable_score = (
+                float(name_forget_effect)
+                * float(selected_salun_ssd_score)
+                / (1e-6 + float(name_retain_impact or 0.0))
+            )
         first = path_records[0]
         path_id = str(first.get("path_id"))
         pair_ids = sorted({record.get("pair_id") for record in path_records if record.get("pair_id") is not None})
@@ -187,6 +227,9 @@ def aggregate_path_score_records(
             "name_forget_effect": name_forget_effect,
             "name_retain_impact": name_retain_impact,
             "name_editable_score": name_editable_score,
+            "selected_salun_ssd_score": selected_salun_ssd_score,
+            "selected_fisher_specificity_margin": selected_fisher_specificity_margin,
+            "name_salun_ssd_editable_score": name_salun_ssd_editable_score,
             "target_names": sorted(
                 {
                     str(record.get("target_name"))
@@ -837,7 +880,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projector_name_effect_ratio_threshold", type=float, default=1.2)
     parser.add_argument(
         "--projector_topk_metric",
-        choices=["name_forget_effect", "name_editable_score", "NameSuf"],
+        choices=["name_forget_effect", "name_editable_score", "name_salun_ssd_editable_score", "NameSuf"],
         default="name_forget_effect",
         help="Metric used to rank high name-sensitive projector paths promoted into P_forget.",
     )

@@ -297,6 +297,38 @@ def test_path_saliency_specificity():
     assert set(saliency["retain_anchors"].keys()) == {"same_topic", "same_reasoning", "counterfactual_retain"}
 
 
+def test_path_saliency_specificity_can_target_name_tokens():
+    torch.manual_seed(12)
+    model = ToyModel()
+    clean_batch = _prepared_batch(
+        torch.tensor([[1, 2, 3, 4]]),
+        sample={"question": "q", "answer": "Alice Smith is here.", "name": "Alice Smith"},
+        target_answer_text="Alice Smith is here.",
+    )
+    retain_batches = {
+        "same_topic": _prepared_batch(
+            torch.tensor([[1, 2, 4, 5]]),
+            sample={"question": "q", "answer": "Bob Jones is here.", "name": "Bob Jones"},
+            target_answer_text="Bob Jones is here.",
+        )
+    }
+
+    saliency = compute_path_saliency_specificity(
+        model=model,
+        forget_batch=clean_batch,
+        retain_batches=retain_batches,
+        candidate_path=_candidate_path(),
+        strict=True,
+        target="target_name",
+        processor_or_tokenizer=DummyProcessor(),
+    )
+
+    assert saliency["status"] == "ok"
+    assert saliency["target"] == "target_name"
+    assert saliency["forget_saliency"] >= 0.0
+    assert set(saliency["retain_anchors"].keys()) == {"same_topic"}
+
+
 def test_vision_path_causal_scores():
     torch.manual_seed(13)
     model = ToyModel()
@@ -480,6 +512,7 @@ def test_step5_falls_back_when_corrupt_input_matches_clean():
 def main():
     test_causal_scores()
     test_path_saliency_specificity()
+    test_path_saliency_specificity_can_target_name_tokens()
     test_vision_path_causal_scores()
     test_vision_text_projector_path_causal_scores()
     test_step5_can_emit_name_token_scores()

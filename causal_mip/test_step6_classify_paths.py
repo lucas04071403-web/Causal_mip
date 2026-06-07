@@ -53,6 +53,26 @@ def _name_record(path_id, pair_id, name_nec, name_suf, name_ret, modality="text"
     }
 
 
+def _name_projector_dim_record(path_id, pair_id, name_nec, name_suf, name_ret, salun_score):
+    return {
+        **_name_record(
+            path_id,
+            pair_id,
+            name_nec=name_nec,
+            name_suf=name_suf,
+            name_ret=name_ret,
+            modality="vision_text",
+            contains_projector=True,
+        ),
+        "candidate_metadata": {
+            "selected_projector_dims": [
+                {"dim_index": 1, "salun_ssd_score": salun_score, "fisher_specificity_margin": 0.1},
+                {"dim_index": 2, "salun_ssd_score": salun_score, "fisher_specificity_margin": 0.1},
+            ]
+        },
+    }
+
+
 def test_explicit_threshold_classification():
     records = [
         _record("p_forget", "pair_0", 0.8, 0.2, 0.1),
@@ -343,6 +363,44 @@ def test_name_aware_projector_topk_can_use_editable_score():
     assert summary["eligibility"]["projector_topk_metric"] == "name_editable_score"
 
 
+def test_name_aware_projector_topk_can_use_salun_ssd_editable_score():
+    records = [
+        _name_projector_dim_record(
+            "p_projector_high_name_low_dim",
+            "pair_0",
+            name_nec=0.9,
+            name_suf=0.4,
+            name_ret=0.2,
+            salun_score=0.1,
+        ),
+        _name_projector_dim_record(
+            "p_projector_balanced_high_dim",
+            "pair_0",
+            name_nec=0.45,
+            name_suf=0.2,
+            name_ret=0.2,
+            salun_score=1.0,
+        ),
+        _name_record("p_retain", "pair_0", 0.0, 0.0, 1.0),
+    ]
+    categories, summary = classify_path_scores(
+        records,
+        name_aware_forget=True,
+        name_forget_threshold=0.5,
+        name_retain_threshold=0.1,
+        max_forget_projector_paths=1,
+        projector_name_effect_ratio_threshold=1.2,
+        projector_topk_metric="name_salun_ssd_editable_score",
+    )
+
+    forget_ids = [record["path_id"] for record in categories[CATEGORY_FORGET]]
+    assert forget_ids == ["p_projector_balanced_high_dim"]
+    promoted = categories[CATEGORY_FORGET][0]
+    assert promoted["selected_salun_ssd_score"] == 1.0
+    assert promoted["name_salun_ssd_editable_score"] > 1.0
+    assert summary["eligibility"]["projector_topk_metric"] == "name_salun_ssd_editable_score"
+
+
 def test_jsonl_io():
     records = [
         _record("p_forget", "pair_0", 1.0, 0.1, 0.0),
@@ -382,6 +440,7 @@ def main():
     test_name_aware_classification_uses_name_scores()
     test_name_aware_projector_topk_can_enter_forget()
     test_name_aware_projector_topk_can_use_editable_score()
+    test_name_aware_projector_topk_can_use_salun_ssd_editable_score()
     test_jsonl_io()
     print("Step 6 path-classification tests passed.")
 

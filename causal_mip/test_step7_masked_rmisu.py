@@ -19,6 +19,7 @@ from causal_mip.editing.masked_rmisu import (
     _labels_for_answer_without_name_ce,
     _labels_for_redacted_positive_ce,
     _labels_for_target_ce,
+    _targeted_entropy_loss,
 )
 from partial_linear import PartialLinear
 
@@ -744,6 +745,100 @@ def test_masked_rmisu_redacted_name_preference_objective_smoke():
         assert loss["preference_positive_loss"] != 0.0
 
 
+def test_masked_rmisu_bounded_name_ce_ascent_objective_smoke():
+    torch.manual_seed(23)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("forget_path", [_node(0, 2)])])
+        _write_jsonl(p_forget_path, [{"path_id": "forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        retain_loader = [_batch_with_items(0)]
+        forget_loader = [_batch_with_items(2)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.0,
+            shared_alpha=0.0,
+            forget_objective="bounded_name_ce_ascent",
+            forget_ce_alpha=0.2,
+            bounded_delta_l2_alpha=0.1,
+            bounded_delta_max_norm=0.05,
+            learning_rate=1e-3,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            config=config,
+        )
+        loss = summary["losses"][0]
+        assert summary["forget_config"]["target_ce_scope"] == "name"
+        assert summary["forget_config"]["bounded_delta_l2_alpha"] == 0.1
+        assert summary["forget_config"]["bounded_delta_max_norm"] == 0.05
+        assert loss["forget_ce_token_count"] == 1
+        assert loss["forget_ce_loss"] != 0.0
+        assert "bounded_delta_l2_loss" in loss
+
+
+def test_masked_rmisu_pii_name_token_noise_objective_smoke():
+    torch.manual_seed(29)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("forget_path", [_node(0, 2)])])
+        _write_jsonl(p_forget_path, [{"path_id": "forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        retain_loader = [_batch_with_items(0)]
+        forget_loader = [_batch_with_items(2)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.0,
+            shared_alpha=0.0,
+            forget_objective="pii_name_token_noise",
+            forget_ce_alpha=0.2,
+            pii_noise_alpha=0.05,
+            learning_rate=1e-4,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            config=config,
+        )
+        loss = summary["losses"][0]
+        assert summary["forget_config"]["target_ce_scope"] == "name"
+        assert summary["forget_config"]["pii_noise_alpha"] == 0.05
+        assert loss["forget_ce_token_count"] == 1
+        assert loss["forget_ce_loss"] != 0.0
+        assert loss["pii_noise_loss"] != 0.0
+
+        labels, _ = _labels_for_target_ce(_batch_with_items(2), "name", torch.device("cpu"))
+        assert labels is not None
+        assert _targeted_entropy_loss(torch.randn(1, 4, 32), labels) > 0
+
+
 def main():
     test_mask_build_and_parameter_wrap()
     test_vision_mask_build_and_parameter_wrap()
@@ -759,6 +854,8 @@ def main():
     test_masked_rmisu_name_ce_ascent_objective_smoke()
     test_masked_rmisu_name_preference_unlearning_objective_smoke()
     test_masked_rmisu_redacted_name_preference_objective_smoke()
+    test_masked_rmisu_bounded_name_ce_ascent_objective_smoke()
+    test_masked_rmisu_pii_name_token_noise_objective_smoke()
     print("Step 7 masked RMisU tests passed.")
 
 

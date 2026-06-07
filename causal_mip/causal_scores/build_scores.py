@@ -66,6 +66,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="If > 0, keep top per-dimension saliency scores for whole-vector nodes such as projectors.",
     )
     parser.add_argument(
+        "--saliency_target",
+        choices=["answer", "target_name"],
+        default="answer",
+        help="Backprop target for SalUn/SSD-style saliency. target_name scopes gradients to name tokens.",
+    )
+    parser.add_argument(
         "--retain_anchor_types",
         nargs="*",
         choices=["same_topic", "same_reasoning", "counterfactual_retain"],
@@ -156,6 +162,7 @@ def main() -> None:
                     saliency_gamma=args.saliency_gamma,
                     saliency_eps=args.saliency_eps,
                     saliency_max_dim_scores=args.saliency_max_dim_scores,
+                    saliency_target=args.saliency_target,
                     retain_anchor_types=set(args.retain_anchor_types) if args.retain_anchor_types else None,
                 )
             )
@@ -172,6 +179,7 @@ def main() -> None:
         "saliency_gamma": args.saliency_gamma,
         "saliency_eps": args.saliency_eps,
         "saliency_max_dim_scores": args.saliency_max_dim_scores,
+        "saliency_target": args.saliency_target,
         "retain_anchor_types": args.retain_anchor_types,
         "output_path": args.output,
     }

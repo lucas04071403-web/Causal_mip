@@ -109,7 +109,12 @@ def _retain_dim_anchor_scores(
     return anchor_scores
 
 
-def score_projector_dims(record: dict[str, Any], gamma: float = 1.0, eps: float = 1e-6) -> list[dict[str, Any]]:
+def score_projector_dims(
+    record: dict[str, Any],
+    gamma: float = 1.0,
+    eps: float = 1e-6,
+    fisher_penalty: float = 1.0,
+) -> list[dict[str, Any]]:
     saliency = record.get("saliency_specificity") or {}
     forget = saliency.get("forget") or {}
     retain_anchors = saliency.get("retain_anchors") or {}
@@ -169,12 +174,28 @@ def score_projector_dims(record: dict[str, Any], gamma: float = 1.0, eps: float 
                     "retain_anchor_fisher_saliency": retain_fisher,
                     "fisher_specificity_margin": (float(forget_fisher) if forget_fisher is not None else 0.0)
                     - gamma * retain_fisher,
+                    "salun_ssd_score": forget_saliency
+                    / (eps + max_anchor_retain_saliency + fisher_penalty * retain_fisher),
                 }
             )
     return dim_records
 
 
-def _rank_key(record: dict[str, Any]) -> tuple[float, ...]:
+def _rank_key(record: dict[str, Any], rank_metric: str = "worst_anchor_margin") -> tuple[float, ...]:
+    if rank_metric == "salun_ssd_score":
+        return (
+            float(record.get("salun_ssd_score") or 0.0),
+            float(record.get("min_anchor_margin") or 0.0),
+            float(record.get("fisher_specificity_margin") or 0.0),
+            float(record.get("forget_saliency") or 0.0),
+        )
+    if rank_metric == "fisher_specificity":
+        return (
+            float(record.get("fisher_specificity_margin") or 0.0),
+            float(record.get("min_anchor_margin") or 0.0),
+            float(record.get("min_anchor_ratio") or 0.0),
+            float(record.get("forget_saliency") or 0.0),
+        )
     return (
         float(record.get("min_anchor_margin") or 0.0),
         float(record.get("min_anchor_ratio") or 0.0),
@@ -191,6 +212,9 @@ def _select_dims(
     min_anchor_margin: float | None = None,
     min_anchor_ratio: float | None = None,
     max_anchor_retain_saliency: float | None = None,
+    max_anchor_retain_fisher_saliency: float | None = None,
+    min_fisher_specificity_margin: float | None = None,
+    rank_metric: str = "worst_anchor_margin",
 ) -> list[dict[str, Any]]:
     filtered = []
     for dim_record in dim_records:
@@ -213,8 +237,18 @@ def _select_dims(
             anchor_retain is None or anchor_retain > max_anchor_retain_saliency
         ):
             continue
+        retain_fisher = _as_float(dim_record.get("retain_anchor_fisher_saliency"))
+        if max_anchor_retain_fisher_saliency is not None and (
+            retain_fisher is None or retain_fisher > max_anchor_retain_fisher_saliency
+        ):
+            continue
+        fisher_margin = _as_float(dim_record.get("fisher_specificity_margin"))
+        if min_fisher_specificity_margin is not None and (
+            fisher_margin is None or fisher_margin < min_fisher_specificity_margin
+        ):
+            continue
         filtered.append(dim_record)
-    return sorted(filtered, key=_rank_key, reverse=True)[:top_k_dims]
+    return sorted(filtered, key=lambda record: _rank_key(record, rank_metric), reverse=True)[:top_k_dims]
 
 
 def _selected_dim_signature(item: dict[str, Any]) -> tuple[str, tuple[int, ...]]:
@@ -261,7 +295,7 @@ def _clone_dim_path(
         path_id=new_path_id,
         source=f"{original.source}_projector_dim_specific",
         modality=original.modality,
-        mip_score=float(mean([float(dim["saliency_specificity_margin"]) for dim in selected_dims])),
+    mip_score=float(mean([float(dim["saliency_specificity_margin"]) for dim in selected_dims])),
         nodes=nodes,
         source_sample_idx=original.source_sample_idx,
         metadata={
@@ -271,6 +305,12 @@ def _clone_dim_path(
             "projector_dim_level": True,
             "projector_dim_pair_id": pair_id,
             "selected_projector_dims": selected_dims,
+            "mean_selected_salun_ssd_score": float(
+                mean([float(dim.get("salun_ssd_score") or 0.0) for dim in selected_dims])
+            ),
+            "mean_selected_fisher_specificity_margin": float(
+                mean([float(dim.get("fisher_specificity_margin") or 0.0) for dim in selected_dims])
+            ),
         },
     )
     return candidate
@@ -294,6 +334,10 @@ def export_projector_dim_candidates(
     min_anchor_margin: float | None = None,
     min_anchor_ratio: float | None = None,
     max_anchor_retain_saliency: float | None = None,
+    max_anchor_retain_fisher_saliency: float | None = None,
+    min_fisher_specificity_margin: float | None = None,
+    rank_metric: str = "worst_anchor_margin",
+    fisher_penalty: float = 1.0,
     dedupe_selected: bool = False,
 ) -> dict[str, Any]:
     raw_scores = []
@@ -312,7 +356,7 @@ def export_projector_dim_candidates(
         original = candidate_by_id.get(str(record.get("path_id")))
         if original is None:
             continue
-        dim_records = score_projector_dims(record, gamma=gamma, eps=eps)
+        dim_records = score_projector_dims(record, gamma=gamma, eps=eps, fisher_penalty=fisher_penalty)
         selected_dims = _select_dims(
             dim_records,
             top_k_dims=top_k_dims,
@@ -320,6 +364,9 @@ def export_projector_dim_candidates(
             min_anchor_margin=min_anchor_margin,
             min_anchor_ratio=min_anchor_ratio,
             max_anchor_retain_saliency=max_anchor_retain_saliency,
+            max_anchor_retain_fisher_saliency=max_anchor_retain_fisher_saliency,
+            min_fisher_specificity_margin=min_fisher_specificity_margin,
+            rank_metric=rank_metric,
         )
         if not selected_dims:
             continue
@@ -331,6 +378,13 @@ def export_projector_dim_candidates(
                 "mean_margin": float(mean([float(dim["saliency_specificity_margin"]) for dim in selected_dims])),
                 "best_min_anchor_margin": float(max(float(dim["min_anchor_margin"]) for dim in selected_dims)),
                 "mean_min_anchor_margin": float(mean([float(dim["min_anchor_margin"]) for dim in selected_dims])),
+                "best_salun_ssd_score": float(max(float(dim.get("salun_ssd_score") or 0.0) for dim in selected_dims)),
+                "mean_salun_ssd_score": float(
+                    mean([float(dim.get("salun_ssd_score") or 0.0) for dim in selected_dims])
+                ),
+                "mean_fisher_specificity_margin": float(
+                    mean([float(dim.get("fisher_specificity_margin") or 0.0) for dim in selected_dims])
+                ),
             }
         )
 
@@ -395,6 +449,9 @@ def export_projector_dim_candidates(
                 "mean_dim_specificity_margin": item["mean_margin"],
                 "best_dim_min_anchor_margin": item["best_min_anchor_margin"],
                 "mean_dim_min_anchor_margin": item["mean_min_anchor_margin"],
+                "best_dim_salun_ssd_score": item["best_salun_ssd_score"],
+                "mean_dim_salun_ssd_score": item["mean_salun_ssd_score"],
+                "mean_dim_fisher_specificity_margin": item["mean_fisher_specificity_margin"],
             }
         )
 
@@ -422,6 +479,10 @@ def export_projector_dim_candidates(
             "min_anchor_margin": min_anchor_margin,
             "min_anchor_ratio": min_anchor_ratio,
             "max_anchor_retain_saliency": max_anchor_retain_saliency,
+            "max_anchor_retain_fisher_saliency": max_anchor_retain_fisher_saliency,
+            "min_fisher_specificity_margin": min_fisher_specificity_margin,
+            "rank_metric": rank_metric,
+            "fisher_penalty": fisher_penalty,
             "dedupe_selected": dedupe_selected,
         },
     }
@@ -454,6 +515,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_anchor_margin", type=float, default=None)
     parser.add_argument("--min_anchor_ratio", type=float, default=None)
     parser.add_argument("--max_anchor_retain_saliency", type=float, default=None)
+    parser.add_argument("--max_anchor_retain_fisher_saliency", type=float, default=None)
+    parser.add_argument("--min_fisher_specificity_margin", type=float, default=None)
+    parser.add_argument(
+        "--dim_rank_metric",
+        choices=["worst_anchor_margin", "salun_ssd_score", "fisher_specificity"],
+        default="worst_anchor_margin",
+    )
+    parser.add_argument("--fisher_penalty", type=float, default=1.0)
     parser.add_argument("--dedupe_selected", action="store_true", default=False)
     return parser
 
@@ -478,6 +547,10 @@ def main() -> None:
         min_anchor_margin=args.min_anchor_margin,
         min_anchor_ratio=args.min_anchor_ratio,
         max_anchor_retain_saliency=args.max_anchor_retain_saliency,
+        max_anchor_retain_fisher_saliency=args.max_anchor_retain_fisher_saliency,
+        min_fisher_specificity_margin=args.min_fisher_specificity_margin,
+        rank_metric=args.dim_rank_metric,
+        fisher_penalty=args.fisher_penalty,
         dedupe_selected=args.dedupe_selected,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
