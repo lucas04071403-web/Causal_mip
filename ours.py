@@ -7,7 +7,18 @@ from ig import ig_main
 from fisher import fisher_main
 
 
-def our(model, forget_loader, forget_text_loader, forget_indices, retain_loader, retain_text_loader, retain_indices, sampled_forget_loader, args):
+def our(
+    model,
+    forget_loader,
+    forget_text_loader,
+    forget_indices,
+    retain_loader,
+    retain_text_loader,
+    retain_indices,
+    sampled_forget_loader,
+    args,
+    counterfactual_anchor_loader=None,
+):
     if "Qwen2-" in args.model:
             t_length = len(model.model.layers)
             v_length = len(model.visual.blocks)
@@ -89,6 +100,8 @@ def our(model, forget_loader, forget_text_loader, forget_indices, retain_loader,
             bounded_delta_max_norm=args.masked_rmisu_bounded_delta_max_norm,
             pii_noise_alpha=args.masked_rmisu_pii_noise_alpha,
             target_ce_scope=args.masked_rmisu_target_ce_scope,
+            counterfactual_anchor_alpha=args.masked_rmisu_counterfactual_anchor_alpha,
+            counterfactual_anchor_scope=args.masked_rmisu_counterfactual_anchor_scope,
             projector_edit_mode=args.masked_rmisu_projector_edit_mode,
             steering_coeff=args.rmu_steering_coeff,
             coeffs=args.rmu_coeffs,
@@ -107,6 +120,7 @@ def our(model, forget_loader, forget_text_loader, forget_indices, retain_loader,
             retain_loader=retain_loader,
             forget_loader=sampled_forget_loader,
             config=config,
+            counterfactual_anchor_loader=counterfactual_anchor_loader,
         )
     else:
         frozen_retain_cache = precompute_rmu_retain_activations(model, retain_loader, args.rmu_layer_id)

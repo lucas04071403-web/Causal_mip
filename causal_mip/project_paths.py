@@ -15,3 +15,22 @@ def workspace_path(*parts: str) -> str:
 
 def workspace_path_with_sep(*parts: str) -> str:
     return str(WORKSPACE_ROOT.joinpath(*parts)) + "/"
+
+
+def resolve_workspace_dataset_path(dataset_path: str) -> str:
+    """Map stale absolute mip_workspace/datasets paths to this workspace."""
+    path = Path(dataset_path)
+    if path.exists():
+        return str(path)
+
+    parts = path.parts
+    if "datasets" not in parts:
+        return str(path)
+    datasets_index = parts.index("datasets")
+    suffix = parts[datasets_index + 1 :]
+    if not suffix:
+        return str(path)
+    relocated = WORKSPACE_ROOT.joinpath("datasets", *suffix)
+    if relocated.exists():
+        return str(relocated)
+    return str(path)

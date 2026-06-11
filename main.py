@@ -138,6 +138,15 @@ parser.add_argument(
     default="all",
     choices=["all", "answer", "name"],
 )
+parser.add_argument("--masked_rmisu_counterfactual_anchor_pairs", type=str, default=None)
+parser.add_argument("--masked_rmisu_counterfactual_anchor_alpha", type=float, default=0.0)
+parser.add_argument(
+    "--masked_rmisu_counterfactual_anchor_scope",
+    type=str,
+    default="name",
+    choices=["all", "answer", "name"],
+)
+parser.add_argument("--masked_rmisu_counterfactual_anchor_max_examples", type=int, default=None)
 parser.add_argument(
     "--masked_rmisu_projector_edit_mode",
     type=str,
@@ -147,6 +156,7 @@ parser.add_argument(
 parser.add_argument("--masked_rmisu_output", type=str, default=None)
 parser.add_argument("--masked_rmisu_checkpoint_dir", type=str, default=None)
 parser.add_argument("--masked_rmisu_max_steps", type=int, default=None)
+parser.add_argument("--initial_full_checkpoint", type=str, default=None)
 parser.add_argument("--skip_post_unlearning_eval", action='store_true', default=False)
 
 parser.add_argument("--ptm_ckpt_batch_size", type=int, default=16)
@@ -200,7 +210,7 @@ def main():
         if args.export_candidate_paths_only:
             return
 
-    from load_model import load_base_model, load_model, load_peft_model
+    from load_model import load_base_model, load_model, load_peft_model, load_full_model_checkpoint
     from load_data import load_data_train,  load_data_retain, load_data_forget, load_data_finetune
     from train_eval import train, evaluate_clf, evaluate_gen
     from unlearning import ga_difference_training
@@ -227,7 +237,10 @@ def main():
 
     batch_size = args.batch_size
     args.batch_size = args.ptm_ckpt_batch_size
-    model = load_peft_model(args, trainable=True)
+    if args.initial_full_checkpoint:
+        model = load_full_model_checkpoint(args, args.initial_full_checkpoint, trainable=True)
+    else:
+        model = load_peft_model(args, trainable=True)
     args.batch_size = batch_size
 
     if args.eval_flag:
@@ -273,11 +286,43 @@ def main():
         torch.cuda.empty_cache()
         model = npo(forgetloader, retainloader, model, model_finetune_on_retainset, args)
     elif args.unlearning == "our":
-        model = model.merge_and_unload()
+        if hasattr(model, "merge_and_unload"):
+            model = model.merge_and_unload()
         model.requires_grad_(True)
         sampler = WeightedRandomSampler(weights=[1.0] * len(forget_indices), num_samples=len(retain_indices), replacement=True)
         sampled_forget_loader = DataLoader(forgetset_train, sampler=sampler, batch_size=args.batch_size, collate_fn=collate)
-        model = our(model, forgetloader, forget_text_loader, forget_indices, retainloader, retain_text_loader, retain_indices, sampled_forget_loader, args)
+        counterfactual_anchor_loader = None
+        if args.masked_rmisu_counterfactual_anchor_alpha != 0.0:
+            if args.masked_rmisu_counterfactual_anchor_pairs is None:
+                raise ValueError(
+                    "--masked_rmisu_counterfactual_anchor_pairs is required when "
+                    "--masked_rmisu_counterfactual_anchor_alpha is non-zero"
+                )
+            from causal_mip.data_pairs.pair_sample_dataset import PairSampleDataset
+
+            counterfactual_anchor_set = PairSampleDataset(
+                args.masked_rmisu_counterfactual_anchor_pairs,
+                sample_key="counterfactual_retain",
+                max_examples=args.masked_rmisu_counterfactual_anchor_max_examples,
+            )
+            counterfactual_anchor_loader = DataLoader(
+                counterfactual_anchor_set,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=collate,
+            )
+        model = our(
+            model,
+            forgetloader,
+            forget_text_loader,
+            forget_indices,
+            retainloader,
+            retain_text_loader,
+            retain_indices,
+            sampled_forget_loader,
+            args,
+            counterfactual_anchor_loader=counterfactual_anchor_loader,
+        )
     elif args.unlearning == "manu":
         model = model.merge_and_unload()
         from manu import MANUPruner

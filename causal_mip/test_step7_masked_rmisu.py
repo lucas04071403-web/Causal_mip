@@ -839,6 +839,53 @@ def test_masked_rmisu_pii_name_token_noise_objective_smoke():
         assert _targeted_entropy_loss(torch.randn(1, 4, 32), labels) > 0
 
 
+def test_masked_rmisu_counterfactual_anchor_smoke():
+    torch.manual_seed(31)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        candidates_path = temp / "P_cand.jsonl"
+        p_forget_path = temp / "P_forget.jsonl"
+        p_shared_path = temp / "P_shared.jsonl"
+        _write_jsonl(candidates_path, [_candidate("forget_path", [_node(0, 2)])])
+        _write_jsonl(p_forget_path, [{"path_id": "forget_path"}])
+        _write_jsonl(p_shared_path, [])
+
+        updated_model = ToyModel()
+        retain_loader = [_batch_with_items(0)]
+        forget_loader = [_batch_with_items(2)]
+        counterfactual_anchor_loader = [_batch_with_items(4)]
+        config = MaskedRMisUConfig(
+            candidate_paths_path=str(candidates_path),
+            p_forget_path=str(p_forget_path),
+            p_shared_path=str(p_shared_path),
+            alpha=0.0,
+            beta=0.0,
+            shared_alpha=0.0,
+            forget_objective="pii_name_token_noise",
+            forget_ce_alpha=0.2,
+            pii_noise_alpha=0.05,
+            counterfactual_anchor_alpha=0.03,
+            counterfactual_anchor_scope="name",
+            learning_rate=1e-4,
+            epochs=1,
+            save=False,
+        )
+
+        _, summary = masked_rmisu_finetune(
+            updated_model=updated_model,
+            frozen_model=None,
+            retain_loader=retain_loader,
+            forget_loader=forget_loader,
+            counterfactual_anchor_loader=counterfactual_anchor_loader,
+            config=config,
+        )
+        loss = summary["losses"][0]
+        assert summary["forget_config"]["counterfactual_anchor_alpha"] == 0.03
+        assert summary["forget_config"]["counterfactual_anchor_scope"] == "name"
+        assert loss["counterfactual_anchor_token_count"] == 1
+        assert loss["counterfactual_anchor_loss"] != 0.0
+
+
 def main():
     test_mask_build_and_parameter_wrap()
     test_vision_mask_build_and_parameter_wrap()
@@ -856,6 +903,7 @@ def main():
     test_masked_rmisu_redacted_name_preference_objective_smoke()
     test_masked_rmisu_bounded_name_ce_ascent_objective_smoke()
     test_masked_rmisu_pii_name_token_noise_objective_smoke()
+    test_masked_rmisu_counterfactual_anchor_smoke()
     print("Step 7 masked RMisU tests passed.")
 
 

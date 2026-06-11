@@ -20,6 +20,7 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from metrics.bleu.bleu import Bleu
 from metrics.rouge.rouge import Rouge
+from causal_mip.project_paths import resolve_workspace_dataset_path
 
 
 IMAGE_CAPTION_QUESTION = "Describe the visible scene and objects in this image without identifying the person."
@@ -50,7 +51,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
 def load_dataset_item(image_ref: dict[str, Any] | None) -> dict[str, Any] | None:
     if not image_ref:
         return None
-    dataset_path = image_ref["dataset_path"]
+    dataset_path = resolve_workspace_dataset_path(image_ref["dataset_path"])
     row_idx = int(image_ref["row_idx"])
     try:
         dataset = load_from_disk(dataset_path)

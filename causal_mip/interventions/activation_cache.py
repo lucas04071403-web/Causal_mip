@@ -11,6 +11,7 @@ import torch
 
 from causal_mip.interventions.hooks import TraceDict, get_module
 from causal_mip.path_localization.path_schema import CandidatePath
+from causal_mip.project_paths import resolve_workspace_dataset_path
 
 ALL_VISUAL_TOKEN_POSITIONS = [-1]
 WHOLE_VECTOR_NEURON = -1
@@ -122,6 +123,7 @@ class SampleReferenceResolver:
         self._dataset_cache: dict[str, list[dict[str, Any]]] = {}
 
     def _load_rows(self, dataset_path: str) -> list[dict[str, Any]]:
+        dataset_path = resolve_workspace_dataset_path(dataset_path)
         if dataset_path not in self._dataset_cache:
             path = Path(dataset_path)
             if path.is_dir():

@@ -95,3 +95,30 @@ def load_peft_model(args, trainable=False, identifier=""):
         model = get_peft_model(model, lora_config)
     model.to(args.device)
     return model
+
+
+def load_full_model_checkpoint(args, checkpoint_path: str, trainable: bool = True):
+    print("Loading full model checkpoint: " + checkpoint_path)
+    if args.model == "Qwen2-VL-2B-Instruct":
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            checkpoint_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+    elif args.model in {"Qwen2.5-VL-3B-Instruct", "Qwen2.5-VL-7B-Instruct"}:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            checkpoint_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+    elif args.model == "llava-1.5-7b-hf":
+        model = LlavaForConditionalGeneration.from_pretrained(
+            checkpoint_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        raise ValueError(f"Unsupported model for full checkpoint loading: {args.model}")
+    model.to(args.device)
+    model.requires_grad_(trainable)
+    return model

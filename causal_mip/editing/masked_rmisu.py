@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal
+import itertools
 
 import torch
 from torch import nn
@@ -82,6 +83,8 @@ class MaskedRMisUConfig:
     bounded_delta_max_norm: float | None = None
     pii_noise_alpha: float = 0.0
     target_ce_scope: str = "all"
+    counterfactual_anchor_alpha: float = 0.0
+    counterfactual_anchor_scope: str = "name"
     projector_edit_mode: ProjectorEditMode = "qwen_merger_mlp"
     steering_coeff: float = 6.5
     coeffs: float = 1.0
@@ -833,6 +836,11 @@ def _validate_forget_objective(config: MaskedRMisUConfig) -> None:
             f"Unsupported target_ce_scope={config.target_ce_scope}. "
             f"Expected one of {sorted(allowed_scopes)}."
         )
+    if config.counterfactual_anchor_scope not in allowed_scopes:
+        raise ValueError(
+            f"Unsupported counterfactual_anchor_scope={config.counterfactual_anchor_scope}. "
+            f"Expected one of {sorted(allowed_scopes)}."
+        )
 
 
 def _ce_scope_for_objective(config: MaskedRMisUConfig) -> str:
@@ -857,6 +865,7 @@ def masked_rmisu_finetune(
     retain_loader,
     forget_loader,
     config: MaskedRMisUConfig,
+    counterfactual_anchor_loader=None,
 ) -> tuple[nn.Module, dict[str, Any]]:
     _validate_forget_objective(config)
     masks = build_path_neuron_masks(
@@ -885,6 +894,13 @@ def masked_rmisu_finetune(
     updated_model.train()
     if frozen_model is not None:
         frozen_model.eval()
+    counterfactual_anchor_iterator = None
+    if config.counterfactual_anchor_alpha != 0.0:
+        if counterfactual_anchor_loader is None:
+            raise ValueError(
+                "counterfactual_anchor_alpha requires counterfactual_anchor_loader"
+            )
+        counterfactual_anchor_iterator = itertools.cycle(counterfactual_anchor_loader)
 
     for epoch in range(config.epochs):
         iterator = tqdm(
@@ -959,6 +975,22 @@ def masked_rmisu_finetune(
             if config.forget_objective == "bounded_name_ce_ascent" and config.bounded_delta_l2_alpha != 0.0:
                 bounded_delta_l2_loss = _partial_linear_delta_l2_loss(updated_model).to(device)
 
+            counterfactual_anchor_loss = torch.tensor(0.0, device=device)
+            counterfactual_anchor_token_count = 0
+            if counterfactual_anchor_iterator is not None:
+                counterfactual_anchor_batch = next(counterfactual_anchor_iterator)
+                counterfactual_anchor_output = _forward_batch(updated_model, counterfactual_anchor_batch)
+                anchor_labels, counterfactual_anchor_token_count = _labels_for_target_ce(
+                    counterfactual_anchor_batch,
+                    config.counterfactual_anchor_scope,
+                    device,
+                )
+                if anchor_labels is not None:
+                    counterfactual_anchor_loss = _targeted_ce_loss(
+                        counterfactual_anchor_output.logits,
+                        anchor_labels,
+                    )
+
             preference_positive_loss = torch.tensor(0.0, device=device)
             preference_positive_token_count = 0
             if config.forget_objective in {"name_preference_unlearning", "redacted_name_preference"}:
@@ -1011,6 +1043,7 @@ def masked_rmisu_finetune(
                 + config.shared_alpha * shared_loss
                 + config.preference_positive_alpha * preference_positive_loss
                 + config.bounded_delta_l2_alpha * bounded_delta_l2_loss
+                + config.counterfactual_anchor_alpha * counterfactual_anchor_loss
                 - config.forget_ce_alpha * forget_ce_loss
                 - config.pii_noise_alpha * pii_noise_loss
             )
@@ -1034,6 +1067,8 @@ def masked_rmisu_finetune(
                 "preference_positive_token_count": preference_positive_token_count,
                 "pii_noise_loss": float(pii_noise_loss.detach().cpu().item()),
                 "bounded_delta_l2_loss": float(bounded_delta_l2_loss.detach().cpu().item()),
+                "counterfactual_anchor_loss": float(counterfactual_anchor_loss.detach().cpu().item()),
+                "counterfactual_anchor_token_count": counterfactual_anchor_token_count,
                 "retain_loss": float(retain_loss.detach().cpu().item()),
                 "shared_loss": float(shared_loss.detach().cpu().item()),
             }
@@ -1047,6 +1082,7 @@ def masked_rmisu_finetune(
                     pref_pos=record["preference_positive_loss"],
                     pii_noise=record["pii_noise_loss"],
                     bound_l2=record["bounded_delta_l2_loss"],
+                    cf_anchor=record["counterfactual_anchor_loss"],
                     retain=record["retain_loss"],
                     shared=record["shared_loss"],
                 )
@@ -1070,6 +1106,8 @@ def masked_rmisu_finetune(
             "bounded_delta_max_norm": config.bounded_delta_max_norm,
             "pii_noise_alpha": config.pii_noise_alpha,
             "target_ce_scope": _ce_scope_for_objective(config),
+            "counterfactual_anchor_alpha": config.counterfactual_anchor_alpha,
+            "counterfactual_anchor_scope": config.counterfactual_anchor_scope,
         },
         "num_loss_records": len(losses),
         "losses": losses,
